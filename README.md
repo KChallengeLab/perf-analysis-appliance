@@ -1,60 +1,111 @@
-# perf-analysis-docker-pack
+# perf-analysis-appliance
 
-Headless Docker appliance that runs the perf pipeline on the boat (or against the simulator):
-a local **InfluxDB** (Linux container), the **bridge**, and **detection with inline analysis**.
-Results land in **Neon**. See [`../onboard-appliance.md`](../onboard-appliance.md) for the full spec.
+A headless, self-contained **Docker appliance** that runs the sailing performance pipeline **on the
+boat**: it ingests the boat's live telemetry, detects points of interest (tacks, gybes, straight
+lines…), analyses them, and ships the results ashore over Starlink — while staying fully autonomous
+if the link drops.
+
+Everything the boat sends is **outbound**. Nothing connects *into* the boat, so its dynamic
+Starlink/CGNAT IP is irrelevant, and there are no inbound ports to expose.
 
 ```
-sim/boat :8085 ──► bridge ──► InfluxDB (container) ──► detection (--inline-analysis) ──► Neon
-                                  gcp_telemetry / B3-CIS-TEST        POIs + analyses (egress-only)
+ boat GCP DataViewer                    ┌───────────── the boat machine (Docker) ─────────────┐
+ 192.168.100.11:8081  ─────────────────►│  bridge ──► InfluxDB (local, the day's telemetry)   │
+                                        │              │                                       │
+                                        │   detection + inline analysis (one process)          │
+                                        │              ├── POI + metrics ──► Neon   (outbound)  │
+                                        │              └── manoeuvre ──► local queue            │
+                                        │                                     │                 │
+                                        │   replicator ── drains queue ──► ±window slice ──────┼──► shore InfluxDB  (outbound)
+                                        │                                                       │
+                                        │   control ── web UI :4267 ── edits the config JSON    │
+                                        └───────────────────────────────────────────────────────┘
 ```
 
-## What's in the box
+## The control panel — `http://<boat>:4267`
 
-| Service | Image | Role |
-|---|---|---|
-| `influxdb` | `influxdb:2.7` | Linux InfluxDB; the day's telemetry. Bucket `B3-CIS-TEST`, measurement `gcp_telemetry`. |
-| `bridge` | `perf-analysis-pack` | DataViewer `:8085` (`Boat.*`) → local Influx. Dashboard on `:8002`. |
-| `detection` | `perf-analysis-pack` | `detection_worker --inline-analysis`: detects POIs **and** analyses them in one process, writes to Neon. No separate analysis service, no Neon read-back. |
+One page to run the appliance without touching files or compose. Live:
 
-`perf-analysis-pack` is built once from `../sailing-data-toolkit/Dockerfile` (sdt CLI + bridge + workers).
+- **Telemetry source** — the GCP host/IP + port to read (real boat `192.168.100.11:8081`, sim
+  `192.168.20.13:8085`). Changing it restarts the bridge automatically.
+- **Egress parameters** — the POI window (± seconds), the sample rate (Hz), and the `needed`
+  channel list. These hot-reload into the replicator **with no restart**.
+- **Status** — every container's state + the egress queue depth.
+- **Update toolkit from GitHub** — `git pull` (or submodule update) then rebuild the worker
+  containers, with a streamed log.
+- **Restart** any service.
 
-## Prerequisites
+All of it just edits one file — `config/appliance.json` (a Docker volume) — which is the appliance's
+**single source of truth**:
 
-- **Docker Desktop with the WSL2 backend** (Linux containers — InfluxDB-on-Windows is unstable).
-- Network reachability to the telemetry source (`SIM_HOST:8085`) and a reachable Neon branch.
-- A **boat row** for `ONBOARD_BOAT` must exist in the Neon DB (`B3` / `boat_class=AC75` is already seeded in the test branch).
+```jsonc
+{
+  "version": 7,                 // bumped on every save
+  "gcp_host": "192.168.100.11", // telemetry source (control-editable)
+  "gcp_port": 8081,
+  "window_s": 30,               // ± window around each manoeuvre
+  "downsample_ms": 200,         // 200 ms = 5 Hz egress grid (0 = native rate)
+  "needed_channels": ["Boat.TWA", "Boat.TWS_kts", "..."]  // [] / null = all channels
+}
+```
 
-## Run
+## Services
+
+| Service | Role |
+|---|---|
+| `influxdb` | Linux InfluxDB — the day's telemetry (measurement `gcp_telemetry`). |
+| `bridge` | GCP DataViewer → local Influx (source from the config JSON). |
+| `detection` | `detection_worker --inline-analysis`: detects **and** analyses in one process (no Neon read-back); POIs+analyses → Neon, manoeuvres → local egress queue. |
+| `replicator` | drains the local queue → ships each manoeuvre's ±window slice to the **shore** Influx (needed channels, downsampled, grouped, gzipped, idempotent). |
+| `shore-influxdb` | test-rig stand-in for the real shore Influx (drop it on the boat; set `SHORE_INFLUX_URL`). |
+| `control` | the web panel above (`:4267`). |
+
+## Quick start
 
 ```bash
-cp .env.example .env        # then edit: INFLUX_TOKEN/PASSWORD, SIM_HOST, Neon URL
-docker compose build        # first build is large (toolkit pulls pandas/scipy/sklearn/...)
-docker compose up           # or: up -d
+git clone --recursive <appliance-repo-url> perf-analysis-appliance
+cd perf-analysis-appliance
+cp .env.example .env          # fill INFLUX/SHORE tokens, Neon URL, HOST_PROJECT_DIR
+docker compose up -d --build
+```
+Then open `http://localhost:4267` and set the source + egress parameters.
+
+Prerequisites: **Docker with a Linux engine** (native Linux, or Docker Desktop / Docker-in-WSL2 on
+Windows — InfluxDB-on-Windows is not supported). The boat machine must reach the GCP host on the LAN
+and Neon + the shore Influx over the link (outbound only).
+
+See **[`DEPLOYMENT.md`](DEPLOYMENT.md)** for the full boat runbook (prereqs, persistence, boat prep).
+
+## Repository layout & keeping it up to date
+
+The toolkit is upstream (`KChallengeLab/…`); the appliance pins it as a **git submodule** so a boat
+build is reproducible and can still track upstream:
+
+```
+perf-analysis-appliance/          # this repo
+├── docker-compose.yml            # the 6-service stack
+├── control/                      # the :4267 web panel (own image)
+├── .env / .env.example
+├── DEPLOYMENT.md
+└── sailing-data-toolkit/         # git submodule → the pipeline (bridge, workers, boats, models)
 ```
 
-Check it:
-- **Bridge dashboard:** http://localhost:8002
-- **InfluxDB UI:** http://localhost:8087 (login with `INFLUX_USERNAME` / `INFLUX_PASSWORD`) — look for measurement `gcp_telemetry` in bucket `B3-CIS-TEST`.
-- **POIs/analyses:** in the Neon branch (`pois`, `straight_line_pois`, `manoeuvre_pois`, `*_analyses` for boat `B3`).
-- **Logs:** `docker compose logs -f bridge` / `detection`.
+- **Pin a tested version:** the submodule records the exact toolkit commit the appliance was built
+  and validated with.
+- **Update:** the control panel's *Update* button (or `git submodule update --remote && docker
+  compose up -d --build`) pulls the latest toolkit and rebuilds the workers.
+- **Why not a monorepo:** the toolkit lives upstream and we rebase on its `main`; vendoring it would
+  make pulling those updates painful.
 
-Stop / reset:
-```bash
-docker compose down            # keep data
-docker compose down -v         # also wipe the Influx volume
-```
+> See `DEPLOYMENT.md` §Repository for the one-time GitHub setup (push the toolkit branch, create the
+> appliance repo, `git submodule add`).
 
-## Notes & current limitations
+## Design notes
 
-- **The sim must be actively sailing** for the nav/wind channels (`Boat.TWA`, `Boat.TWS_kts`, `Boat.VMG_kts`, the `_n` variants) to stream. Idle → raw sensors only → detection finds no manoeuvres. (All 76 B3 channels exist in `AC75_ILS.Blocks`; they just don't emit values when parked.)
-- The `bridge` is the **existing sim bridge** parameterised for B3. A dedicated onboard B3 bridge will replace it; `--no-filter` will become the **Channel Hub manifest** filter (Phase 2).
-- On the **boat**, set `SIM_HOST=host.docker.internal` to reach the DataViewer on the Windows host.
-- The toolkit changes this relies on (`--inline-analysis`, env-overridable B3 bucket, `ONBOARD_BOAT`) live on branch `feat/onboard-b3-influx-bucket-override` — build from that branch.
-
-## Phasing (per the spec)
-
-- **Phase 0 (this):** sim → bridge → local Influx → detection+inline-analysis → test Neon.
-- **Phase 1:** add the `replicator` (POI ±30 s window → shore Influx).
-- **Phase 2:** bridge consumes the Channel Hub manifest (drop `--no-filter`).
-- **Phase 3:** repoint to `host.docker.internal:8085` on the boat; prod Neon + prod shore Influx.
+- **Timestamps** are the GCP frame's `tUTC` (authoritative); the bridge stamps each line with the
+  latest tUTC of its flush window.
+- **Detection ↔ analysis** is in-process and in-memory — the boat never round-trips a POI through
+  Neon to hand it between two local processes.
+- **The replicator's work list is a local file**, never a network query — so a dropped link never
+  stops it from knowing *what* to send; entries queue and ship on reconnect (idempotent on `poi_id`).
+- **Egress is small:** needed-channels + downsample + grouped + gzip ≈ **1–2 MB/h** on a busy leg.

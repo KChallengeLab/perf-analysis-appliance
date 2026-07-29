@@ -14,6 +14,38 @@ boat GCP 192.168.100.11:8081 ──► bridge ──► InfluxDB (local containe
 Everything the boat sends is **outbound** (POIs→Neon, windows→shore Influx). Nothing connects *into*
 the boat → the boat's Starlink/CGNAT IP is irrelevant.
 
+> **Day-to-day you drive it from the control panel** at `http://<boat>:4267` — telemetry source
+> (GCP host/port), POI window, sample Hz, needed channels, status, restart, and "update from GitHub".
+> It just edits `config/appliance.json`. The steps below are the one-time bring-up.
+
+---
+
+## Repository & updates (one-time GitHub setup)
+
+The appliance pins the toolkit as a **git submodule** — reproducible boat builds, still able to track
+upstream. Set it up once:
+
+```bash
+# 1. push the toolkit work branch to a remote you control (a fork or the org)
+cd sailing-data-toolkit
+git push <your-remote> feat/onboard-b3-influx-bucket-override
+
+# 2. create an empty "perf-analysis-appliance" repo on GitHub, then in the pack:
+cd ../perf-analysis-docker-pack
+git submodule add -b feat/onboard-b3-influx-bucket-override <toolkit-remote-url> sailing-data-toolkit
+git add . && git commit -m "Appliance + toolkit submodule" && git push
+```
+
+Deploy / clone anywhere:
+```bash
+git clone --recursive <appliance-repo-url>          # brings the toolkit submodule
+# later, to update the toolkit to its latest:
+git submodule update --remote && docker compose up -d --build   # (the control panel's Update button does this)
+```
+
+> **Not a monorepo:** the toolkit is upstream (`KChallengeLab/…`) and we rebase on its `main`;
+> vendoring it into one repo would make those updates painful. Submodule keeps both clean.
+
 ---
 
 ## 0. Before the CIS arrives — prepare these (so you're ready)

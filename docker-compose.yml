@@ -43,12 +43,16 @@ services:
     depends_on:
       influxdb:
         condition: service_healthy
+    environment:
+      # GCP source host/port come from the config JSON (control UI editable); SIM_HOST/PORT are
+      # the fallback if the config has none. Changing them = the UI restarts this service.
+      ONBOARD_CONFIG: /config/appliance.json
+      SIM_HOST: ${SIM_HOST:-192.168.100.11}
+      SIM_PORT: ${SIM_PORT:-8081}
     command:
       - python
       - -m
-      - sailing_data_toolkit.bridges.gcp_dataviewer_bridge
-      - "--host=${SIM_HOST:?set SIM_HOST in .env}"
-      - "--gcp-port=${SIM_PORT:-8085}"
+      - sailing_data_toolkit.bridges.onboard_launcher
       - "--influx-url=http://influxdb:8086"
       - "--influx-token=${INFLUX_TOKEN}"
       - "--influx-org=${INFLUX_ORG:-metrics-org}"
@@ -57,6 +61,8 @@ services:
       - "--no-filter"
       - "--write-groups=*"
       - "--port=8002"
+    volumes:
+      - config:/config
     ports:
       - "${BRIDGE_HOST_PORT:-8002}:8002"   # bridge dashboard at http://localhost:8002
 

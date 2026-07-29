@@ -61,12 +61,21 @@ def _write_config(cfg: dict):
 @app.on_event("startup")
 def _seed_config():
     if not CONFIG_PATH.exists():
-        _write_config({"version": 1, "window_s": 30, "downsample_ms": 200, "needed_channels": _default_channels()})
+        _write_config({
+            "version": 1,
+            "gcp_host": os.getenv("SIM_HOST", "192.168.100.11"),
+            "gcp_port": int(os.getenv("SIM_PORT", "8081")),
+            "window_s": 30,
+            "downsample_ms": 200,
+            "needed_channels": _default_channels(),
+        })
 
 
 class ConfigIn(BaseModel):
     window_s: float
     hz: float                      # UI works in Hz; stored as downsample_ms
+    gcp_host: str | None = None
+    gcp_port: int | None = None
     needed_channels: list[str] | None = None
     all_channels: bool = False     # when true, ship every channel in the window
 
@@ -86,16 +95,30 @@ def set_config(body: ConfigIn):
     downsample_ms = 0 if body.hz <= 0 else int(round(1000.0 / body.hz))
     channels = None if body.all_channels else (body.needed_channels or [])
     cfg = _load_config()
+    old_host, old_port = cfg.get("gcp_host"), cfg.get("gcp_port")
+    new_host = (body.gcp_host or old_host or "").strip() or old_host
+    new_port = int(body.gcp_port) if body.gcp_port else old_port
     cfg.update(
         version=int(cfg.get("version", 0)) + 1,
+        gcp_host=new_host,
+        gcp_port=new_port,
         window_s=float(body.window_s),
         downsample_ms=downsample_ms,
         needed_channels=channels,
         updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
     _write_config(cfg)
+
+    # window / Hz / channels hot-reload in the replicator; the GCP source only takes effect on a
+    # bridge restart. Do it in the background so the save returns immediately.
+    bridge_restarted = False
+    if (new_host, new_port) != (old_host, old_port):
+        threading.Thread(target=lambda: _compose("restart", "bridge", timeout=120), daemon=True).start()
+        bridge_restarted = True
+
     return {"ok": True, "version": cfg["version"], "downsample_ms": downsample_ms,
-            "channels": "all" if channels is None else len(channels)}
+            "channels": "all" if channels is None else len(channels),
+            "gcp": f"{new_host}:{new_port}", "bridge_restarted": bridge_restarted}
 
 
 # ---------------------------------------------------------------- docker ----
@@ -234,6 +257,15 @@ HTML_PAGE = """<!doctype html>
 <header><h1>⚓ Onboard Appliance</h1><span class="badge" id="boat">B3</span><span class="badge muted" id="ver"></span></header>
 <main>
  <section class="card">
+  <h2>Telemetry source (GCP / DataViewer)</h2>
+  <div class="row">
+   <div><label>Host / IP</label><input id="gcp_host" placeholder="192.168.100.11"/></div>
+   <div><label>Port</label><input id="gcp_port" type="number" min="1" placeholder="8081"/></div>
+  </div>
+  <p class="muted" style="margin:8px 0 0">Changing the source restarts the bridge automatically. Real boat = <code>192.168.100.11:8081</code> · sim = <code>192.168.20.13:8085</code>.</p>
+ </section>
+
+ <section class="card">
   <h2>Egress parameters (live)</h2>
   <div class="row">
    <div><label>POI window (± seconds)</label><input id="window" type="number" min="1" step="1"/></div>
@@ -279,17 +311,19 @@ async function refresh(){
 }
 async function loadCfg(){
  const c=await (await fetch('./api/config')).json();
+ $('gcp_host').value=c.gcp_host||''; $('gcp_port').value=c.gcp_port||'';
  $('window').value=c.window_s; $('hz').value=c.hz;
  $('channels').value=(c.needed_channels===null||c.needed_channels===undefined)?'':c.needed_channels.join('\\n');
 }
 async function saveConfig(){
  const lines=$('channels').value.split('\\n').map(s=>s.trim()).filter(Boolean);
- const body={window_s:parseFloat($('window').value),hz:parseFloat($('hz').value),
+ const body={gcp_host:$('gcp_host').value.trim(),gcp_port:parseInt($('gcp_port').value)||null,
+  window_s:parseFloat($('window').value),hz:parseFloat($('hz').value),
   all_channels:lines.length===0,needed_channels:lines};
  const f=$('cfgflash'); f.textContent='saving…'; f.className='flash';
  const r=await fetch('./api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  const j=await r.json();
- if(r.ok){f.textContent=`saved · v${j.version} · ${j.channels==='all'?'all channels':j.channels+' channels'} · downsample ${j.downsample_ms||0}ms`;f.className='flash ok';refresh();}
+ if(r.ok){f.textContent=`saved · v${j.version} · source ${j.gcp}${j.bridge_restarted?' (bridge restarted)':''} · ${j.channels==='all'?'all channels':j.channels+' channels'} · downsample ${j.downsample_ms||0}ms`;f.className='flash ok';refresh();}
  else{f.textContent='error: '+(j.detail||r.status);f.className='flash err';}
 }
 async function restart(svc){const f=$('cfgflash');f.textContent='restarting '+svc+'…';
