@@ -1,0 +1,4 @@
+[submodule "sailing-data-toolkit"]
+	path = sailing-data-toolkit
+	url = https://github.com/KChallengeLab/sailing-data-toolkit
+	branch = feat/onboard-b3-influx-bucket-override

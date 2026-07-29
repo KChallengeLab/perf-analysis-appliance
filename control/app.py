@@ -190,11 +190,13 @@ def _run_update():
 
     try:
         UPDATE_LOG.write_text(f"# update started {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
-        if not TOOLKIT_DIR or not COMPOSE_FILE:
-            log("TOOLKIT_DIR / COMPOSE_FILE not set — cannot update from here.")
+        project = os.path.dirname(COMPOSE_FILE) if COMPOSE_FILE else ""
+        if not project or not os.path.isdir(project):
+            log("COMPOSE_FILE not set / project dir missing — cannot update from here.")
             return
-        if stream(["git", "-C", TOOLKIT_DIR, "pull", "--ff-only"]) != 0:
-            log("git pull failed — aborting (no rebuild).")
+        # Pull the toolkit submodule to the tip of its tracked branch.
+        if stream(["git", "-C", project, "submodule", "update", "--remote", "--init", "sailing-data-toolkit"]) != 0:
+            log("submodule update failed — aborting (no rebuild).")
             return
         # rebuild + recreate only the worker containers (leave control/influx running)
         stream(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--build"] + WORKER_SERVICES)

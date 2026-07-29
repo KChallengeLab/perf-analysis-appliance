@@ -8,7 +8,7 @@
 
 x-toolkit: &toolkit
   build:
-    context: ../sailing-data-toolkit
+    context: ./sailing-data-toolkit   # git submodule → KChallengeLab/sailing-data-toolkit
   image: perf-analysis-pack:latest
   restart: unless-stopped
 
@@ -170,7 +170,8 @@ services:
       CONFIG_PATH: /config/appliance.json
       SPOOL_DIR: /spool
       # Host paths so `docker compose` (run here) sends the daemon valid build-context paths.
-      COMPOSE_FILE: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env}/perf-analysis-docker-pack/docker-compose.yml
+      # HOST_PROJECT_DIR = this appliance repo's dir (holds the compose + the toolkit submodule).
+      COMPOSE_FILE: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env}/docker-compose.yml
       TOOLKIT_DIR: ${HOST_PROJECT_DIR}/sailing-data-toolkit
     ports:
       - "${CONTROL_HOST_PORT:-4267}:4267"
