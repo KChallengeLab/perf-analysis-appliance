@@ -1,0 +1,184 @@
+# Perf-analysis appliance — Phase 0 sim rig.
+#
+#   sim :8085 ──► bridge ──► InfluxDB (Linux container) ──► detection (--inline-analysis) ──► Neon
+#
+# One toolkit image (built from ../sailing-data-toolkit), different commands per service.
+# Analysis runs IN-PROCESS inside detection (--inline-analysis) — no separate analysis service,
+# no Neon read-back (the boat↔shore link is egress-only).
+
+x-toolkit: &toolkit
+  build:
+    context: ../sailing-data-toolkit
+  image: perf-analysis-pack:latest
+  restart: unless-stopped
+
+services:
+  # InfluxDB MUST be a Linux container (Influx-on-Windows is unstable). Docker Desktop / WSL2.
+  influxdb:
+    image: influxdb:2.7
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USERNAME:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD:?set INFLUX_PASSWORD in .env}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-metrics-org}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-B3-CIS-TEST}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN in .env}
+      # Retention left infinite here; the spec keeps "the current day" + nightly .db, purge on demand.
+    volumes:
+      - influx-data:/var/lib/influxdb2
+    ports:
+      - "${INFLUX_HOST_PORT:-8087}:8086"   # browse at http://localhost:8087
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # Bridge: subscribes to the DataViewer on :8085 and writes Boat.* → gcp_telemetry in the local bucket.
+  # NOTE: this is the existing sim bridge parameterised for B3 (validated). A dedicated onboard B3
+  # bridge will replace it later (and --no-filter will become the Hub manifest filter, Phase 2).
+  bridge:
+    <<: *toolkit
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - sailing_data_toolkit.bridges.gcp_dataviewer_bridge
+      - "--host=${SIM_HOST:?set SIM_HOST in .env}"
+      - "--gcp-port=${SIM_PORT:-8085}"
+      - "--influx-url=http://influxdb:8086"
+      - "--influx-token=${INFLUX_TOKEN}"
+      - "--influx-org=${INFLUX_ORG:-metrics-org}"
+      - "--influx-bucket=${INFLUX_BUCKET:-B3-CIS-TEST}"
+      - "--prefix=Boat"
+      - "--no-filter"
+      - "--write-groups=*"
+      - "--port=8002"
+    ports:
+      - "${BRIDGE_HOST_PORT:-8002}:8002"   # bridge dashboard at http://localhost:8002
+
+  # Detection + inline analysis (one process). POIs → Neon, analyses written in the same process.
+  detection:
+    <<: *toolkit
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    environment:
+      ONBOARD_BOAT: ${ONBOARD_BOAT:-B3}
+      # Stamped into created_by / updated_by on every DB write — the ORM requires it.
+      USERNAME: ${USERNAME:-onboard-appliance}
+      ONBOARD_INLINE_ANALYSIS: "1"
+      # B3 (AC75) fetcher → the local Influx container, test bucket, gcp_telemetry measurement.
+      AC37_40_INFLUXDB_URL: http://influxdb:8086
+      AC37_40_INFLUXDB_TOKEN: ${INFLUX_TOKEN}
+      AC37_40_INFLUXDB_ORG: ${INFLUX_ORG:-metrics-org}
+      AC37_75_INFLUXDB_BUCKET: ${INFLUX_BUCKET:-B3-CIS-TEST}
+      AC37_75_INFLUXDB_MEASUREMENT: gcp_telemetry
+      # POIs land here (env var name passed to --database).
+      AC75_ONBOARD_TEST_POSTGRES_URL: ${AC75_ONBOARD_TEST_POSTGRES_URL:?set AC75_ONBOARD_TEST_POSTGRES_URL in .env}
+      # Local egress queue: detected manoeuvres are appended here for the replicator to drain.
+      ONBOARD_EGRESS_SPOOL: /spool
+    command:
+      - python
+      - -m
+      - sailing_data_toolkit.workers.detection_worker
+      - --inline-analysis
+      - "--interval=${DETECT_INTERVAL:-20}"
+      - "--lookback=${DETECT_LOOKBACK:-600}"
+      - "--overlap=30"
+      - --database=AC75_ONBOARD_TEST_POSTGRES_URL
+    volumes:
+      - spool:/spool
+
+  # Shore InfluxDB — the replicator's egress destination. In the test rig it's a 2nd local
+  # container; on the boat, set SHORE_INFLUX_URL to the real shore Influx (hostname) and drop this.
+  shore-influxdb:
+    image: influxdb:2.7
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USERNAME:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${SHORE_INFLUX_PASSWORD:?set SHORE_INFLUX_PASSWORD in .env}
+      DOCKER_INFLUXDB_INIT_ORG: ${SHORE_INFLUX_ORG:-metrics-org}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${SHORE_INFLUX_BUCKET:-B3-CIS-TEST}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${SHORE_INFLUX_TOKEN:?set SHORE_INFLUX_TOKEN in .env}
+    volumes:
+      - shore-influx-data:/var/lib/influxdb2
+    ports:
+      - "${SHORE_INFLUX_HOST_PORT:-8088}:8086"   # browse at http://localhost:8088
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # Replicator: per-manoeuvre ±30s window from local Influx → shore Influx. Outbound, idempotent.
+  replicator:
+    <<: *toolkit
+    depends_on:
+      influxdb:
+        condition: service_healthy
+      shore-influxdb:
+        condition: service_healthy
+    environment:
+      ONBOARD_BOAT: ${ONBOARD_BOAT:-B3}
+      REPLICATOR_SPOOL: /spool
+      # local source (the boat's day Influx) — read-only, local
+      AC37_40_INFLUXDB_URL: http://influxdb:8086
+      AC37_40_INFLUXDB_TOKEN: ${INFLUX_TOKEN}
+      AC37_40_INFLUXDB_ORG: ${INFLUX_ORG:-metrics-org}
+      AC37_75_INFLUXDB_BUCKET: ${INFLUX_BUCKET:-B3-CIS-TEST}
+      AC37_75_INFLUXDB_MEASUREMENT: gcp_telemetry
+      # shore destination (test: the shore-influxdb container; boat: real shore Influx hostname)
+      SHORE_INFLUX_URL: ${SHORE_INFLUX_URL:-http://shore-influxdb:8086}
+      SHORE_INFLUX_TOKEN: ${SHORE_INFLUX_TOKEN}
+      SHORE_INFLUX_ORG: ${SHORE_INFLUX_ORG:-metrics-org}
+      SHORE_INFLUX_BUCKET: ${SHORE_INFLUX_BUCKET:-B3-CIS-TEST}
+      # Hot-reloaded config the control UI writes (window_s, downsample_ms, needed_channels).
+      ONBOARD_CONFIG: /config/appliance.json
+      # No Neon here on purpose: the work list comes from the local queue, never from the network.
+    command:
+      - python
+      - -m
+      - sailing_data_toolkit.workers.replicator
+      - "--window-s=${REPLICATOR_WINDOW_S:-30}"
+      - "--poll-interval=10"
+      - --spool=/spool
+      - --config=/config/appliance.json
+    volumes:
+      - spool:/spool
+      - config:/config
+
+  # Control panel — browser UI on :4267 to tune the egress (window / Hz / needed channels, live)
+  # and update the toolkit from GitHub. Talks to Docker via the mounted socket.
+  control:
+    build:
+      context: ./control
+    image: perf-analysis-control:latest
+    restart: unless-stopped
+    environment:
+      ONBOARD_BOAT: ${ONBOARD_BOAT:-B3}
+      CONFIG_PATH: /config/appliance.json
+      SPOOL_DIR: /spool
+      # Host paths so `docker compose` (run here) sends the daemon valid build-context paths.
+      COMPOSE_FILE: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env}/perf-analysis-docker-pack/docker-compose.yml
+      TOOLKIT_DIR: ${HOST_PROJECT_DIR}/sailing-data-toolkit
+    ports:
+      - "${CONTROL_HOST_PORT:-4267}:4267"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - config:/config
+      - spool:/spool
+      # The project mounted at its own host path, so compose build contexts resolve on the daemon.
+      - type: bind
+        source: ${HOST_PROJECT_DIR}
+        target: ${HOST_PROJECT_DIR}
+
+volumes:
+  influx-data:
+  shore-influx-data:
+  spool:
+  config:
