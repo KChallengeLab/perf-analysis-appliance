@@ -201,6 +201,7 @@ services:
       # chercher elle-meme et le met en cache — le navigateur du bord n'a pas a joindre le shore.
       SHORE_CHANNELS_URL: ${SHORE_CHANNELS_URL:-}
       SHORE_CHANNELS_TOKEN: ${SHORE_CHANNELS_TOKEN:-}
+      SHORE_CHANNELS_URL_SIM: ${SHORE_CHANNELS_URL_SIM:-}
       # Host paths so `docker compose` (run here) sends the daemon valid build-context paths.
       # HOST_PROJECT_DIR = this appliance repo's dir (holds the compose + the toolkit submodule).
       COMPOSE_FILE: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env}/docker-compose.yml

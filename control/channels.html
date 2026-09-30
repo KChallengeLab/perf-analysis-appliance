@@ -61,7 +61,8 @@
       <button id="selAll">Tout cocher</button>
       <button id="selNone">Tout décocher</button>
       <span class="grow"></span>
-      <button id="fetch">Importer le filtre du shore</button>
+      <button id="fetchSim" data-src="sim" title="Catalogue = ac75_sim_full.toml (perf-nav :4444)">Fetch Sim</button>
+      <button id="fetchReal" data-src="real" title="Catalogue = ac75_full.toml (perf-nav :4444)">Fetch Real</button>
       <button class="p" id="save">Enregistrer</button>
     </div>
     <div class="msg" id="msg"></div>
@@ -98,10 +99,11 @@ async function load(){
     ? cat.tables
     : {'sélection actuelle': cat.channels};   // pas encore de catalogue shore
   S.selected = new Set(cat.selected || []);
+  const label = {sim: 'Sim', real: 'Real'}[cat.variant] || 'shore';
   const when = cat.fetched_at
-    ? `Catalogue du shore récupéré le ${cat.fetched_at.replace('T', ' à ').replace('Z', ' UTC')}.`
+    ? `Catalogue ${label} récupéré le ${cat.fetched_at.replace('T', ' à ').replace('Z', ' UTC')}.`
     : (cat.configured
-        ? "Aucun catalogue local pour l'instant — clique « Importer le filtre du shore »."
+        ? "Aucun catalogue local pour l'instant — clique « Fetch Sim » ou « Fetch Real »."
         : "SHORE_CHANNELS_URL n'est pas configuré sur la carte : import indisponible, tu peux quand même cocher/décocher la sélection existante.");
   msg(when);
   render();
@@ -162,17 +164,21 @@ $('selAll').onclick = () => { forVisible(c => S.selected.add(c)); render(); };
 $('selNone').onclick = () => { forVisible(c => S.selected.delete(c)); render(); };
 function forVisible(fn){ Object.values(S.tables).forEach(l => l.filter(match).forEach(fn)); }
 
-$('fetch').onclick = async () => {
-  const b = $('fetch'); const t = b.textContent; b.disabled = true; b.textContent = '…';
+// Fetch Sim / Fetch Real : remplace le catalogue affiche par le TOML correspondant du shore.
+// La selection cochee ne bouge pas tant qu'on n'a pas clique « Enregistrer ».
+async function fetchCatalog(b){
+  const t = b.textContent; b.disabled = true; b.textContent = '…';
   try {
-    const r = await fetch('/api/channels/refresh', {method: 'POST'});
+    const r = await fetch('/api/channels/refresh?source=' + b.dataset.src, {method: 'POST'});
     const d = await r.json();
     if (!r.ok) throw new Error(d.detail || 'échec');
-    msg(`Filtre du shore importé : ${d.count} channels, ${d.tables} tables.`);
     await load();
+    msg(`Catalogue ${t} importé (${d.toml || 'shore'}) : ${d.count} channels, ${d.tables} tables.`);
   } catch (e) { msg('Import impossible — ' + e.message, true); }
   finally { b.disabled = false; b.textContent = t; }
-};
+}
+$('fetchSim').onclick = e => fetchCatalog(e.currentTarget);
+$('fetchReal').onclick = e => fetchCatalog(e.currentTarget);
 
 $('save').onclick = async () => {
   const b = $('save'); b.disabled = true; b.textContent = '…';

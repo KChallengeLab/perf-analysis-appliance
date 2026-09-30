@@ -167,6 +167,10 @@ def set_config(body: ConfigIn):
 
 SHORE_CHANNELS_URL = os.getenv("SHORE_CHANNELS_URL", "")
 SHORE_CHANNELS_TOKEN = os.getenv("SHORE_CHANNELS_TOKEN", "")
+# Deux filtres sur le shore : le vrai bateau (ac75_full.toml) et le simulateur
+# (ac75_sim_full.toml). Par defaut l'URL sim se deduit de l'URL reelle : /app/ac75/… -> /app/ac75sim/….
+SHORE_CHANNELS_URL_SIM = os.getenv("SHORE_CHANNELS_URL_SIM") or re.sub(r"/([^/]+)/channels\.json", r"/\1sim/channels.json", SHORE_CHANNELS_URL)
+CHANNEL_SOURCES = {"real": SHORE_CHANNELS_URL, "sim": SHORE_CHANNELS_URL_SIM}
 CATALOG_PATH = CONFIG_PATH.parent / "shore_channels.json"
 
 
@@ -198,16 +202,21 @@ def channels_catalog():
         "selected": selected,
         "fetched_at": cat.get("fetched_at"),
         "source": cat.get("source"),
+        "variant": cat.get("variant"),
         "configured": bool(SHORE_CHANNELS_URL),
     }
 
 
 @app.post("/api/channels/refresh")
-def channels_refresh():
-    """Va relire le filtre actif sur le shore et le met en cache localement."""
-    if not SHORE_CHANNELS_URL:
+def channels_refresh(source: str = "real"):
+    """Va relire un filtre du shore (source=real : vrai bateau, sim : simulateur) et le met en
+    cache localement."""
+    if source not in CHANNEL_SOURCES:
+        raise HTTPException(400, f"source inconnue '{source}' (real ou sim)")
+    if not CHANNEL_SOURCES[source]:
         raise HTTPException(400, "SHORE_CHANNELS_URL n'est pas configure sur la carte")
-    url = SHORE_CHANNELS_URL
+    src_url = CHANNEL_SOURCES[source]
+    url = src_url
     if SHORE_CHANNELS_TOKEN:
         url += ("&" if "?" in url else "?") + "token=" + SHORE_CHANNELS_TOKEN
     try:
@@ -224,13 +233,15 @@ def channels_refresh():
         "tables": payload.get("tables") or {},
         "count": len(payload["channels"]),
         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": SHORE_CHANNELS_URL,
+        "source": src_url,
+        "variant": source,
+        "toml": payload.get("toml"),
     }
     CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CATALOG_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(cat), encoding="utf-8")
     tmp.replace(CATALOG_PATH)
-    return {"ok": True, "count": cat["count"], "tables": len(cat["tables"]), "fetched_at": cat["fetched_at"]}
+    return {"ok": True, "variant": source, "toml": cat["toml"], "count": cat["count"], "tables": len(cat["tables"]), "fetched_at": cat["fetched_at"]}
 
 
 @app.get("/channels", response_class=HTMLResponse)
