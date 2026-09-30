@@ -1,41 +1,102 @@
-"""Onboard appliance control panel — a small FastAPI service (default :4267).
+"""Onboard Data Analysis Console — l'unique interface de gestion de la carte (defaut :4267).
 
-Lets you, from a browser on the boat:
-  - tune the POI window (±s), the sample rate (Hz) and the `needed` channel set — written to a
-    hot-reloaded config the replicator picks up live (no restart);
-  - see the stack status + egress queue depth;
-  - update the toolkit from GitHub (git pull + rebuild the worker containers);
-  - restart a service.
+Une seule page pour operer le transmetteur depuis un navigateur, sur un poste du bord :
+  - allumer / eteindre / redemarrer la chaine, service par service ou d'un bloc ;
+  - suivre en direct les ressources, la bande passante et les logs (pousses par WebSocket) ;
+  - regler la source GCP, la fenetre POI, la frequence et la liste des channels `needed`
+    (ecrits dans un config relu a chaud : le replicator les prend sans redemarrage) ;
+  - mettre a jour la bibliotheque sailing-data-toolkit depuis GitHub et reconstruire.
 
-It talks to Docker via the mounted socket, so it can (re)build/restart the appliance. Keep it on a
-trusted LAN — the Docker socket is root-equivalent on the host.
+La console parle au demon Docker via le socket monte : elle est root-equivalente sur l'hote.
+A garder sur un LAN de confiance.
 """
+from __future__ import annotations
+
+import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
+from typing import Deque, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config/appliance.json"))
 SPOOL_DIR = Path(os.getenv("SPOOL_DIR", "/spool"))
-COMPOSE_FILE = os.getenv("COMPOSE_FILE", "")           # host path to docker-compose.yml
-TOOLKIT_DIR = os.getenv("TOOLKIT_DIR", "")             # host path to the sailing-data-toolkit repo
+COMPOSE_FILE = os.getenv("COMPOSE_FILE", "")
+TOOLKIT_DIR = os.getenv("TOOLKIT_DIR", "")
 BOAT = os.getenv("ONBOARD_BOAT", "B3")
+PROJECT = os.getenv("COMPOSE_PROJECT", "perf-analysis-appliance")
 DEFAULT_CHANNELS_FILE = Path(os.getenv("DEFAULT_CHANNELS_FILE", "/app/default_channels.json"))
 UPDATE_LOG = Path("/tmp/update.log")
-WORKER_SERVICES = ["bridge", "detection", "replicator"]
 
-app = FastAPI(title="Onboard Appliance Control")
+# La console est elle-meme un service du compose : elle ne doit JAMAIS s'inclure dans un
+# arret groupe, sinon plus rien ne peut la rallumer depuis le navigateur.
+PIPELINE = ["influxdb", "bridge", "detection", "replicator"]
+WORKERS = ["bridge", "detection", "replicator"]
+SELF = "control"
+
+SAMPLE_S = float(os.getenv("SAMPLE_S", "2"))
+HISTORY = int(os.getenv("HISTORY", "300"))
+LOG_LINES = int(os.getenv("LOG_LINES", "600"))
+
+APP_DIR = Path(__file__).parent
+app = FastAPI(title="Onboard Data Analysis Console")
+_FONTS = APP_DIR / "fonts"
+if _FONTS.is_dir():
+    app.mount("/fonts", StaticFiles(directory=str(_FONTS)), name="fonts")
 _update_lock = threading.Lock()
 
+history: Deque[dict] = deque(maxlen=HISTORY)
+logs: Deque[dict] = deque(maxlen=LOG_LINES)
+clients: set = set()
+_prev_net: Dict[str, tuple] = {}
+_prev_at: Optional[float] = None
 
-# ---------------------------------------------------------------- config ----
+
+# ── outils ──────────────────────────────────────────────────────────────────
+
+def _run(cmd: List[str], timeout: float = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _compose(*args, timeout=120) -> subprocess.CompletedProcess:
+    cmd = ["docker", "compose"]
+    if COMPOSE_FILE:
+        cmd += ["-f", COMPOSE_FILE]
+    return _run(cmd + list(args), timeout=timeout)
+
+
+_UNITS = {"b": 1, "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+          "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+_SIZE_RE = re.compile(r"([0-9.]+)\s*([a-zA-Z]+)")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_LEVEL = re.compile(r"\b(ERROR|WARNING|INFO|DEBUG)\b")
+
+
+def _size(text: str) -> float:
+    m = _SIZE_RE.search(text or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1)) * _UNITS.get(m.group(2).lower(), 1)
+    except ValueError:
+        return 0.0
+
+
+def _short(name: str) -> str:
+    return re.sub(r"-\d+$", "", name.removeprefix(f"{PROJECT}-"))
+
+
+# ── config ──────────────────────────────────────────────────────────────────
 
 def _default_channels() -> list:
     try:
@@ -48,133 +109,313 @@ def _load_config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        return {"version": 0, "window_s": 30, "downsample_ms": 200, "needed_channels": _default_channels()}
+        return {"version": 0, "window_s": 30, "downsample_ms": 100, "needed_channels": _default_channels()}
 
 
 def _write_config(cfg: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    tmp.replace(CONFIG_PATH)  # atomic — replicator never sees a half-written file
-
-
-@app.on_event("startup")
-def _seed_config():
-    if not CONFIG_PATH.exists():
-        _write_config({
-            "version": 1,
-            "gcp_host": os.getenv("SIM_HOST", "192.168.100.11"),
-            "gcp_port": int(os.getenv("SIM_PORT", "8081")),
-            "window_s": 30,
-            "downsample_ms": 200,
-            "needed_channels": _default_channels(),
-        })
+    tmp.replace(CONFIG_PATH)  # atomique — le replicator ne voit jamais un fichier a moitie ecrit
 
 
 class ConfigIn(BaseModel):
     window_s: float
-    hz: float                      # UI works in Hz; stored as downsample_ms
+    hz: float
     gcp_host: str | None = None
     gcp_port: int | None = None
     needed_channels: list[str] | None = None
-    all_channels: bool = False     # when true, ship every channel in the window
+    all_channels: bool = False
 
 
 @app.get("/api/config")
 def get_config():
     cfg = _load_config()
-    ds = cfg.get("downsample_ms", 0) or 0
-    cfg["hz"] = round(1000.0 / ds, 3) if ds > 0 else 0
+    ds = int(cfg.get("downsample_ms") or 0)
+    cfg["hz"] = round(1000 / ds, 3) if ds else 0
     return cfg
 
 
 @app.post("/api/config")
 def set_config(body: ConfigIn):
-    if body.window_s <= 0:
-        raise HTTPException(400, "window_s must be > 0")
-    downsample_ms = 0 if body.hz <= 0 else int(round(1000.0 / body.hz))
-    channels = None if body.all_channels else (body.needed_channels or [])
     cfg = _load_config()
-    old_host, old_port = cfg.get("gcp_host"), cfg.get("gcp_port")
-    new_host = (body.gcp_host or old_host or "").strip() or old_host
-    new_port = int(body.gcp_port) if body.gcp_port else old_port
-    cfg.update(
-        version=int(cfg.get("version", 0)) + 1,
-        gcp_host=new_host,
-        gcp_port=new_port,
-        window_s=float(body.window_s),
-        downsample_ms=downsample_ms,
-        needed_channels=channels,
-        updated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    )
+    prev_src = (cfg.get("gcp_host"), cfg.get("gcp_port"))
+    cfg["window_s"] = max(1, int(body.window_s))
+    cfg["downsample_ms"] = int(round(1000 / body.hz)) if body.hz and body.hz > 0 else 0
+    if body.gcp_host:
+        cfg["gcp_host"] = body.gcp_host.strip()
+    if body.gcp_port:
+        cfg["gcp_port"] = int(body.gcp_port)
+    cfg["needed_channels"] = [] if body.all_channels else (body.needed_channels or cfg.get("needed_channels") or [])
+    cfg["version"] = int(cfg.get("version", 0)) + 1
     _write_config(cfg)
-
-    # window / Hz / channels hot-reload in the replicator; the GCP source only takes effect on a
-    # bridge restart. Do it in the background so the save returns immediately.
-    bridge_restarted = False
-    if (new_host, new_port) != (old_host, old_port):
-        threading.Thread(target=lambda: _compose("restart", "bridge", timeout=120), daemon=True).start()
-        bridge_restarted = True
-
-    return {"ok": True, "version": cfg["version"], "downsample_ms": downsample_ms,
-            "channels": "all" if channels is None else len(channels),
-            "gcp": f"{new_host}:{new_port}", "bridge_restarted": bridge_restarted}
+    # La fenetre / la frequence / les channels sont relus a chaud. La source GCP, elle, n'est lue
+    # qu'au demarrage du bridge : on le redemarre uniquement si elle a change.
+    restarted = False
+    if (cfg.get("gcp_host"), cfg.get("gcp_port")) != prev_src:
+        _compose("restart", "bridge")
+        restarted = True
+    return {"ok": True, "version": cfg["version"], "bridge_restarted": restarted}
 
 
-# ---------------------------------------------------------------- docker ----
+# ── catalogue de channels (depuis le shore) ─────────────────────────────────
+# Le catalogue vient de l'editeur de channels du shore (perf-nav :4444), seule source de
+# verite de ce que l'equipe suit. On le recupere COTE SERVEUR : le navigateur du bord n'a
+# pas forcement de route vers le shore, il faudrait du CORS, et le token n'a rien a faire
+# dans une page. Le resultat est mis en cache sur la carte pour que la page reste utilisable
+# quand le lien est coupe — c'est-a-dire la plupart du temps en mer.
 
-def _compose(*args, timeout=60) -> subprocess.CompletedProcess:
-    cmd = ["docker", "compose"]
-    if COMPOSE_FILE:
-        cmd += ["-f", COMPOSE_FILE]
-    cmd += list(args)
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+SHORE_CHANNELS_URL = os.getenv("SHORE_CHANNELS_URL", "")
+SHORE_CHANNELS_TOKEN = os.getenv("SHORE_CHANNELS_TOKEN", "")
+CATALOG_PATH = CONFIG_PATH.parent / "shore_channels.json"
+
+
+def _load_catalog() -> dict:
+    try:
+        return json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.get("/api/channels/catalog")
+def channels_catalog():
+    """Catalogue connu + selection courante, pour la page de selection.
+
+    Le catalogue affiche est l'union du dernier catalogue shore et de la selection actuelle :
+    un channel deja selectionne mais absent du catalogue doit rester visible et decochables,
+    sinon on ne pourrait plus l'enlever.
+    """
+    cat = _load_catalog()
+    selected = _load_config().get("needed_channels") or []
+    known = set(cat.get("channels") or [])
+    tables = dict(cat.get("tables") or {})
+    extra = sorted(set(selected) - known)
+    if extra:
+        tables["(hors catalogue shore)"] = extra
+    return {
+        "tables": tables,
+        "channels": sorted(known | set(selected)),
+        "selected": selected,
+        "fetched_at": cat.get("fetched_at"),
+        "source": cat.get("source"),
+        "configured": bool(SHORE_CHANNELS_URL),
+    }
+
+
+@app.post("/api/channels/refresh")
+def channels_refresh():
+    """Va relire le filtre actif sur le shore et le met en cache localement."""
+    if not SHORE_CHANNELS_URL:
+        raise HTTPException(400, "SHORE_CHANNELS_URL n'est pas configure sur la carte")
+    url = SHORE_CHANNELS_URL
+    if SHORE_CHANNELS_TOKEN:
+        url += ("&" if "?" in url else "?") + "token=" + SHORE_CHANNELS_TOKEN
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=30) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        # Message actionnable : c'est presque toujours le lien ou le token.
+        raise HTTPException(502, f"shore injoignable ou reponse invalide : {e}")
+    if not isinstance(payload.get("channels"), list):
+        raise HTTPException(502, "reponse du shore inattendue (pas de liste 'channels')")
+    cat = {
+        "channels": payload["channels"],
+        "tables": payload.get("tables") or {},
+        "count": len(payload["channels"]),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": SHORE_CHANNELS_URL,
+    }
+    CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CATALOG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cat), encoding="utf-8")
+    tmp.replace(CATALOG_PATH)
+    return {"ok": True, "count": cat["count"], "tables": len(cat["tables"]), "fetched_at": cat["fetched_at"]}
+
+
+@app.get("/channels", response_class=HTMLResponse)
+def channels_page():
+    return (APP_DIR / "channels.html").read_text(encoding="utf-8")
+
+
+@app.get("/console.css")
+def console_css():
+    return Response((APP_DIR / "console.css").read_text(encoding="utf-8"), media_type="text/css")
+
+
+# ── etat + pilotage ─────────────────────────────────────────────────────────
+
+def _services() -> List[dict]:
+    r = _compose("ps", "-a", "--format", "json", timeout=30)
+    rows = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+            rows.append({"name": d.get("Service") or d.get("Name"),
+                         "state": (d.get("State") or "").lower(),
+                         "status": d.get("Status", "")})
+        except Exception:
+            pass
+    return rows
+
+
+def _pipeline_state() -> dict:
+    q = SPOOL_DIR / "manoeuvres.jsonl"
+    cur = SPOOL_DIR / f"replicator_cursor_{BOAT}.json"
+    sent = SPOOL_DIR / f"replicator_sent_{BOAT}.json"
+    queued = size = offset = ranges = 0
+    try:
+        if q.exists():
+            queued = sum(1 for _ in q.open("r", encoding="utf-8"))
+            size = q.stat().st_size
+        if cur.exists():
+            offset = int(json.loads(cur.read_text()).get("offset", 0))
+        if sent.exists():
+            ranges = len(json.loads(sent.read_text()).get("ranges", []))
+    except Exception:
+        pass
+    return {"queued": queued, "pending_bytes": max(0, size - offset), "sent_ranges": ranges}
+
+
+def _system() -> dict:
+    info: Dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            info[k] = int(v.strip().split()[0]) * 1024
+    except Exception:
+        pass
+    total, avail = info.get("MemTotal", 0), info.get("MemAvailable", 0)
+    swt, swf = info.get("SwapTotal", 0), info.get("SwapFree", 0)
+    du = shutil.disk_usage("/spool") if SPOOL_DIR.exists() else None
+    return {"mem_total": total, "mem_used": total - avail,
+            "swap_total": swt, "swap_used": swt - swf,
+            "disk_total": du.total if du else 0, "disk_used": du.used if du else 0}
+
+
+def _stats() -> Dict[str, dict]:
+    r = _run(["docker", "stats", "--no-stream", "--format",
+              "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}"], timeout=25)
+    out: Dict[str, dict] = {}
+    for line in r.stdout.strip().splitlines():
+        p = line.split("|")
+        if len(p) < 5:
+            continue
+        used, _, limit = p[2].partition(" / ")
+        rx, _, tx = p[4].partition(" / ")
+        out[_short(p[0])] = {"cpu": float(p[1].rstrip("%") or 0), "mem": _size(used),
+                             "mem_limit": _size(limit), "mem_pct": float(p[3].rstrip("%") or 0),
+                             "rx": _size(rx), "tx": _size(tx)}
+    return out
+
+
+def _sample() -> dict:
+    global _prev_at
+    now = time.time()
+    st = _stats()
+    dt = (now - _prev_at) if _prev_at else None
+    rates = {}
+    for svc, s in st.items():
+        prev = _prev_net.get(svc)
+        if prev and dt and dt > 0:
+            # Les compteurs repartent de zero quand un conteneur redemarre : delta negatif ignore.
+            rates[svc] = {"rx_s": max(0.0, s["rx"] - prev[0]) / dt, "tx_s": max(0.0, s["tx"] - prev[1]) / dt}
+        else:
+            rates[svc] = {"rx_s": 0.0, "tx_s": 0.0}
+        _prev_net[svc] = (s["rx"], s["tx"])
+    _prev_at = now
+    return {"t": now, "containers": st, "rates": rates, "system": _system(),
+            "pipeline": _pipeline_state(), "services": _services()}
 
 
 @app.get("/api/status")
 def status():
-    out = {"boat": BOAT, "config": get_config()}
-    # containers
+    return {"boat": BOAT, "config": get_config(), "services": _services(),
+            "pipeline": _pipeline_state(), "toolkit": toolkit_version()}
+
+
+class PowerIn(BaseModel):
+    action: str                      # start | stop | restart
+    service: str | None = None       # None = toute la chaine (console exclue)
+
+
+@app.post("/api/power")
+def power(body: PowerIn):
+    if body.action not in ("start", "stop", "restart"):
+        raise HTTPException(400, "action inconnue")
+    if body.service:
+        if body.service == SELF:
+            raise HTTPException(400, "la console ne peut pas se piloter elle-meme")
+        if body.service not in PIPELINE:
+            raise HTTPException(400, f"service inconnu : {body.service}")
+        targets = [body.service]
+    else:
+        targets = PIPELINE
+    # `up -d` plutot que `start` : recree un conteneur supprime au lieu d'echouer.
+    args = (["up", "-d"] + targets) if body.action == "start" else ([body.action] + targets)
+    r = _compose(*args, timeout=240)
+    return {"ok": r.returncode == 0, "targets": targets,
+            "stdout": r.stdout[-4000:], "stderr": r.stderr[-4000:]}
+
+
+# ── version + mise a jour ───────────────────────────────────────────────────
+
+def _git(*args, cwd: str) -> str:
     try:
-        r = _compose("ps", "--format", "json")
-        rows = []
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-                rows.append({"name": d.get("Service") or d.get("Name"), "state": d.get("State"), "status": d.get("Status")})
-            except Exception:
-                pass
-        out["services"] = rows
-    except Exception as e:
-        out["services_error"] = str(e)
-    # egress queue depth
-    q = SPOOL_DIR / "manoeuvres.jsonl"
-    cur = SPOOL_DIR / f"replicator_cursor_{BOAT}.json"
+        r = _run(["git", "-C", cwd] + list(args), timeout=25)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+@app.get("/api/version")
+def toolkit_version():
+    if not TOOLKIT_DIR or not os.path.isdir(TOOLKIT_DIR):
+        return {"available": False, "reason": "TOOLKIT_DIR absent"}
+    dirty = _git("status", "--porcelain", cwd=TOOLKIT_DIR)
+    behind = ""
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=TOOLKIT_DIR)
+    if branch:
+        cnt = _git("rev-list", "--count", f"HEAD..origin/{branch}", cwd=TOOLKIT_DIR)
+        behind = cnt or ""
+    return {
+        "available": True,
+        "branch": branch,
+        "commit": _git("rev-parse", "--short", "HEAD", cwd=TOOLKIT_DIR),
+        "subject": _git("log", "-1", "--pretty=%s", cwd=TOOLKIT_DIR),
+        "date": _git("log", "-1", "--pretty=%ci", cwd=TOOLKIT_DIR),
+        "dirty_files": len([l for l in dirty.splitlines() if l.strip()]),
+        "behind": behind,
+        "update_blocked": (lambda t: None if t[0] else t[1])(_update_is_safe()),
+    }
+
+
+def _update_is_safe() -> tuple[bool, str]:
+    """Le suivi de la branche distante ferait-il perdre des commits locaux ?
+
+    Renvoie (True, "") quand la remise a jour est une avance rapide. Sinon (False, raison) :
+    la branche distante ne contient pas le HEAD local, donc s'y aligner ecraserait du travail.
+    """
+    if not TOOLKIT_DIR or not os.path.isdir(TOOLKIT_DIR):
+        return False, "TOOLKIT_DIR absent"
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=TOOLKIT_DIR)
+    if not branch or branch == "HEAD":
+        return False, "le sous-module n'est sur aucune branche (HEAD detache)"
     try:
-        total_lines = sum(1 for _ in q.open("r", encoding="utf-8")) if q.exists() else 0
-        size = q.stat().st_size if q.exists() else 0
-        offset = json.loads(cur.read_text()).get("offset", 0) if cur.exists() else 0
-        out["egress"] = {"queued_manoeuvres": total_lines, "bytes_total": size, "bytes_shipped": offset,
-                         "pending": max(size - offset, 0)}
+        r = _run(["git", "-C", TOOLKIT_DIR, "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"], timeout=25)
     except Exception as e:
-        out["egress_error"] = str(e)
-    return out
+        return False, f"impossible de comparer a origin/{branch} ({e})"
+    if r.returncode == 0:
+        return True, ""
+    lost = _git("rev-list", "--count", f"origin/{branch}..HEAD", cwd=TOOLKIT_DIR) or "?"
+    return False, (f"origin/{branch} ne contient pas le HEAD local — {lost} commit(s) locaux seraient "
+                   f"perdus (branche rebasee ou non poussee ?)")
 
 
-@app.post("/api/restart/{service}")
-def restart(service: str):
-    if service not in WORKER_SERVICES + ["influxdb", "shore-influxdb"]:
-        raise HTTPException(400, f"unknown service {service}")
-    r = _compose("restart", service, timeout=120)
-    return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr}
-
-
-# ---------------------------------------------------------------- update ----
-
-def _run_update():
+def _run_update(fetch_only: bool = False):
     def log(msg):
         with UPDATE_LOG.open("a", encoding="utf-8") as f:
             f.write(msg.rstrip() + "\n")
@@ -189,157 +430,165 @@ def _run_update():
         return p.returncode
 
     try:
-        UPDATE_LOG.write_text(f"# update started {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
+        UPDATE_LOG.write_text(f"# mise a jour demarree {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
         project = os.path.dirname(COMPOSE_FILE) if COMPOSE_FILE else ""
         if not project or not os.path.isdir(project):
-            log("COMPOSE_FILE not set / project dir missing — cannot update from here.")
+            log("COMPOSE_FILE absent — impossible de mettre a jour depuis ici.")
             return
-        # Pull the toolkit submodule to the tip of its tracked branch.
+        before = _git("rev-parse", "--short", "HEAD", cwd=TOOLKIT_DIR) if TOOLKIT_DIR else "?"
+        log(f"# commit toolkit avant : {before}")
+
+        # Garde-fou : ne jamais reculer. `submodule update --remote` suit la branche distante sans
+        # se soucier de ce qu'il ecrase — si la branche locale a ete rebasee sans etre poussee,
+        # l'operation ramene le toolkit AVANT le rebase et perd du travail en silence.
+        ok, why = _update_is_safe()
+        if not ok:
+            log(f"!! mise a jour refusee : {why}")
+            log("   Rien n'a ete touche. Resoudre la divergence (pousser la branche locale, ou")
+            log("   reinitialiser volontairement le sous-module) avant de relancer.")
+            return
+
         if stream(["git", "-C", project, "submodule", "update", "--remote", "--init", "sailing-data-toolkit"]) != 0:
-            log("submodule update failed — aborting (no rebuild).")
+            log("!! echec du submodule update — aucune reconstruction. Verifie les modifications locales "
+                "(git -C sailing-data-toolkit status) et les droits du depot.")
             return
-        # rebuild + recreate only the worker containers (leave control/influx running)
-        stream(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--build"] + WORKER_SERVICES)
-        log("# update done")
+        after = _git("rev-parse", "--short", "HEAD", cwd=TOOLKIT_DIR) if TOOLKIT_DIR else "?"
+        log(f"# commit toolkit apres : {after}")
+        if after == before:
+            log("# deja a jour — rien a reconstruire.")
+            return
+        if fetch_only:
+            log("# recuperation seule demandee : pas de reconstruction.")
+            return
+        stream(["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--build"] + WORKERS)
+        log("# mise a jour terminee")
     except Exception as e:
-        log(f"update crashed: {e}")
+        log(f"la mise a jour a plante : {e}")
     finally:
         if _update_lock.locked():
             _update_lock.release()
 
 
+class UpdateIn(BaseModel):
+    fetch_only: bool = False
+
+
 @app.post("/api/update")
-def update():
+def update(body: UpdateIn | None = None):
     if not _update_lock.acquire(blocking=False):
-        raise HTTPException(409, "an update is already running")
-    threading.Thread(target=_run_update, daemon=True).start()
+        raise HTTPException(409, "une mise a jour est deja en cours")
+    threading.Thread(target=_run_update, kwargs={"fetch_only": bool(body and body.fetch_only)}, daemon=True).start()
     return {"started": True}
 
 
 @app.get("/api/update/log", response_class=PlainTextResponse)
 def update_log():
-    return UPDATE_LOG.read_text(encoding="utf-8") if UPDATE_LOG.exists() else "(no update run yet)"
+    return UPDATE_LOG.read_text(encoding="utf-8") if UPDATE_LOG.exists() else "(aucune mise a jour lancee)"
 
 
-# ---------------------------------------------------------------- page ------
+# ── flux live ───────────────────────────────────────────────────────────────
+
+async def _broadcast(payload: dict):
+    dead = []
+    for ws in list(clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.discard(ws)
+
+
+async def _sampler():
+    while True:
+        try:
+            snap = await asyncio.to_thread(_sample)
+            history.append(snap)
+            await _broadcast({"type": "sample", "data": snap})
+        except Exception as e:
+            await _broadcast({"type": "error", "data": str(e)})
+        await asyncio.sleep(SAMPLE_S)
+
+
+def _is_running(container: str) -> bool:
+    try:
+        r = _run(["docker", "inspect", "-f", "{{.State.Running}}", container], timeout=15)
+        return r.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
+async def _tail(service: str):
+    """Suit les logs d'un service, en n'emettant que du nouveau.
+
+    Deux pieges evites ici :
+      - `docker logs -f` sur un conteneur ARRETE ne bloque pas : il recrache la fin du journal
+        et rend la main. Se rattacher en boucle rejouait donc les memes lignes toutes les
+        3 secondes, ce qui donnait l'illusion d'un service encore actif. On n'attache donc que
+        si le conteneur tourne, et on attend sinon.
+      - au re-attachement (apres un redemarrage), `--since` borne la lecture a ce qu'on n'a pas
+        encore vu, au lieu de renvoyer un `--tail` deja diffuse.
+    """
+    container = f"{PROJECT}-{service}-1"
+    since: Optional[str] = None
+    while True:
+        if not await asyncio.to_thread(_is_running, container):
+            await asyncio.sleep(3)
+            continue
+        cmd = ["docker", "logs", "-f", container]
+        cmd += (["--since", since] if since else ["--tail", "20"])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            assert proc.stdout is not None
+            async for raw in proc.stdout:
+                text = _ANSI.sub("", raw.decode("utf-8", "replace")).rstrip()
+                if not text:
+                    continue
+                m = _LEVEL.search(text)
+                now = time.time()
+                entry = {"t": now, "svc": service,
+                         "level": (m.group(1) if m else "INFO"), "msg": text[-400:]}
+                # Reprise juste apres la derniere ligne vue, en RFC3339 comme docker l'attend.
+                since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now + 1)) + "Z"
+                logs.append(entry)
+                await _broadcast({"type": "log", "data": entry})
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+
+@app.on_event("startup")
+async def _startup():
+    if not CONFIG_PATH.exists():
+        _write_config({"version": 1,
+                       "gcp_host": os.getenv("SIM_HOST", "192.168.100.11"),
+                       "gcp_port": int(os.getenv("SIM_PORT", "8081")),
+                       "window_s": 30, "downsample_ms": 100,
+                       "needed_channels": _default_channels()})
+    asyncio.create_task(_sampler())
+    for svc in PIPELINE:
+        asyncio.create_task(_tail(svc))
+
+
+@app.websocket("/ws")
+async def ws(sock: WebSocket):
+    await sock.accept()
+    clients.add(sock)
+    try:
+        await sock.send_json({"type": "hello", "data": {
+            "boat": BOAT, "sample_s": SAMPLE_S, "history": list(history), "logs": list(logs),
+            "config": get_config(), "toolkit": toolkit_version(), "pipeline": PIPELINE}})
+        while True:
+            await sock.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        clients.discard(sock)
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTML_PAGE
-
-
-HTML_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Onboard Appliance — Control</title>
-<style>
- :root{color-scheme:light dark}
- *{box-sizing:border-box}
- body{font:14px/1.5 system-ui,sans-serif;margin:0;background:Canvas;color:CanvasText}
- header{padding:16px 20px;border-bottom:1px solid #8884;display:flex;align-items:center;gap:12px}
- header h1{font-size:16px;margin:0}
- .badge{font-size:12px;padding:2px 8px;border:1px solid #8886;border-radius:999px}
- main{max-width:900px;margin:0 auto;padding:20px;display:grid;gap:20px}
- .card{border:1px solid #8884;border-radius:12px;padding:16px}
- .card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.04em;opacity:.7}
- label{display:block;font-weight:600;margin:10px 0 4px}
- input,textarea{width:100%;padding:8px 10px;border:1px solid #8886;border-radius:8px;background:Field;color:FieldText;font:inherit}
- textarea{min-height:120px;font-family:ui-monospace,monospace;font-size:12px}
- .row{display:flex;gap:16px;flex-wrap:wrap}
- .row>div{flex:1;min-width:120px}
- button{padding:9px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font:inherit;font-weight:600;cursor:pointer}
- button.ghost{background:#8883;color:CanvasText}
- button:disabled{opacity:.5;cursor:default}
- .muted{opacity:.65}
- .ok{color:#16a34a}.err{color:#dc2626}
- table{width:100%;border-collapse:collapse;font-size:13px}
- td,th{text-align:left;padding:6px 8px;border-bottom:1px solid #8883}
- pre{background:#8881;padding:10px;border-radius:8px;max-height:260px;overflow:auto;font-size:12px}
- .flash{font-size:13px;min-height:18px}
-</style></head><body>
-<header><h1>⚓ Onboard Appliance</h1><span class="badge" id="boat">B3</span><span class="badge muted" id="ver"></span></header>
-<main>
- <section class="card">
-  <h2>Telemetry source (GCP / DataViewer)</h2>
-  <div class="row">
-   <div><label>Host / IP</label><input id="gcp_host" placeholder="192.168.100.11"/></div>
-   <div><label>Port</label><input id="gcp_port" type="number" min="1" placeholder="8081"/></div>
-  </div>
-  <p class="muted" style="margin:8px 0 0">Changing the source restarts the bridge automatically. Real boat = <code>192.168.100.11:8081</code> · sim = <code>192.168.20.13:8085</code>.</p>
- </section>
-
- <section class="card">
-  <h2>Egress parameters (live)</h2>
-  <div class="row">
-   <div><label>POI window (± seconds)</label><input id="window" type="number" min="1" step="1"/></div>
-   <div><label>Sample rate (Hz, 0 = native)</label><input id="hz" type="number" min="0" step="0.5"/></div>
-  </div>
-  <label>Needed channels (one per line — empty = all channels in window)</label>
-  <textarea id="channels" placeholder="Boat.TWA&#10;Boat.TWS_kts&#10;..."></textarea>
-  <div class="row" style="margin-top:12px;align-items:center">
-   <button onclick="saveConfig()">Save (applies live)</button>
-   <span class="flash" id="cfgflash"></span>
-  </div>
- </section>
-
- <section class="card">
-  <h2>Status</h2>
-  <table id="svc"><tbody></tbody></table>
-  <div id="egress" class="muted" style="margin-top:10px"></div>
-  <div style="margin-top:12px" class="row">
-   <button class="ghost" onclick="refresh()">Refresh</button>
-   <button class="ghost" onclick="restart('replicator')">Restart replicator</button>
-   <button class="ghost" onclick="restart('detection')">Restart detection</button>
-   <button class="ghost" onclick="restart('bridge')">Restart bridge</button>
-  </div>
- </section>
-
- <section class="card">
-  <h2>Update toolkit from GitHub</h2>
-  <p class="muted">Runs <code>git pull</code> then rebuilds the worker containers (bridge, detection, replicator). Influx and this panel keep running.</p>
-  <button id="updbtn" onclick="doUpdate()">Pull &amp; rebuild</button>
-  <span class="flash" id="updflash"></span>
-  <pre id="updlog" style="display:none"></pre>
- </section>
-</main>
-<script>
-const $=id=>document.getElementById(id);
-async function refresh(){
- const s=await (await fetch('./api/status')).json();
- $('boat').textContent=s.boat; $('ver').textContent='config v'+(s.config.version??'?');
- const tb=$('svc').querySelector('tbody'); tb.innerHTML='';
- (s.services||[]).forEach(x=>{const st=(x.state||'').includes('running')?'ok':'err';
-  tb.insertAdjacentHTML('beforeend',`<tr><td>${x.name}</td><td class="${st}">${x.state||''}</td><td class="muted">${x.status||''}</td></tr>`);});
- const e=s.egress; if(e) $('egress').textContent=`egress queue: ${e.queued_manoeuvres} manoeuvres · ${e.pending} bytes pending / ${e.bytes_total} total`;
-}
-async function loadCfg(){
- const c=await (await fetch('./api/config')).json();
- $('gcp_host').value=c.gcp_host||''; $('gcp_port').value=c.gcp_port||'';
- $('window').value=c.window_s; $('hz').value=c.hz;
- $('channels').value=(c.needed_channels===null||c.needed_channels===undefined)?'':c.needed_channels.join('\\n');
-}
-async function saveConfig(){
- const lines=$('channels').value.split('\\n').map(s=>s.trim()).filter(Boolean);
- const body={gcp_host:$('gcp_host').value.trim(),gcp_port:parseInt($('gcp_port').value)||null,
-  window_s:parseFloat($('window').value),hz:parseFloat($('hz').value),
-  all_channels:lines.length===0,needed_channels:lines};
- const f=$('cfgflash'); f.textContent='saving…'; f.className='flash';
- const r=await fetch('./api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- const j=await r.json();
- if(r.ok){f.textContent=`saved · v${j.version} · source ${j.gcp}${j.bridge_restarted?' (bridge restarted)':''} · ${j.channels==='all'?'all channels':j.channels+' channels'} · downsample ${j.downsample_ms||0}ms`;f.className='flash ok';refresh();}
- else{f.textContent='error: '+(j.detail||r.status);f.className='flash err';}
-}
-async function restart(svc){const f=$('cfgflash');f.textContent='restarting '+svc+'…';
- const r=await fetch('./api/restart/'+svc,{method:'POST'});f.textContent=(r.ok?'restarted ':'error ')+svc;setTimeout(refresh,1500);}
-let pollT=null;
-async function doUpdate(){
- $('updbtn').disabled=true;$('updflash').textContent='starting…';$('updlog').style.display='block';
- const r=await fetch('./api/update',{method:'POST'});
- if(!r.ok){$('updflash').textContent='error: '+r.status;$('updbtn').disabled=false;return;}
- $('updflash').textContent='running — this rebuilds images, can take minutes';
- clearInterval(pollT); pollT=setInterval(async()=>{
-  const t=await (await fetch('./api/update/log')).text(); $('updlog').textContent=t; $('updlog').scrollTop=$('updlog').scrollHeight;
-  if(t.includes('# update done')||t.includes('aborting')||t.includes('crashed')){clearInterval(pollT);$('updbtn').disabled=false;$('updflash').textContent='finished';refresh();}
- },2000);
-}
-loadCfg();refresh();setInterval(refresh,8000);
-</script></body></html>"""
+    return (APP_DIR / "index.html").read_text(encoding="utf-8")

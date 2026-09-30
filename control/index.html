@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onboard Data Analysis Console</title>
+<link rel="stylesheet" href="/console.css">
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Onboard Data Analysis Console <span id="boat" style="color:var(--accent)">B3</span></h1>
+  <span class="grow"></span>
+  <span class="theme" id="theme" role="group" aria-label="Theme">
+    <button data-t="auto">Auto</button><button data-t="light">Clair</button><button data-t="dark">Sombre</button>
+  </span>
+  <span class="mono" style="color:var(--mut)" id="clock">—</span>
+</header>
+
+<main>
+  <section class="tiles" id="tiles"></section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Alimentation
+        <span style="margin-left:auto;display:flex;gap:6px;text-transform:none;letter-spacing:0">
+          <button class="p" id="allOn">Tout allumer</button>
+          <button class="d" id="allOff">Tout éteindre</button>
+        </span>
+      </h2>
+      <div id="svcs"></div>
+      <p class="note" style="padding:0 13px 12px">
+        La console reste toujours allumée : c'est elle qui rallume le reste. « Tout éteindre » ne
+        touche pas au flux entrant du bateau, seulement à la chaîne de traitement.
+      </p>
+    </div>
+
+    <div class="panel">
+      <h2>Bibliothèque sailing-data-toolkit</h2>
+      <div class="pad" id="tk"><span class="empty">chargement…</span></div>
+      <div class="warnbox" id="tkWarn"></div>
+      <div style="padding:0 13px 13px;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="p" id="upd">Mettre à jour et reconstruire</button>
+        <button id="updFetch">Vérifier seulement</button>
+        <button id="updLog">Voir le journal</button>
+      </div>
+      <pre id="updOut" style="display:none"></pre>
+    </div>
+  </section>
+
+  <section class="row">
+    <div class="panel">
+      <h2>Mémoire par conteneur <span class="legend" id="legMem"></span></h2>
+      <canvas id="cMem"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Bande passante
+        <span class="legend">
+          <span><i class="sw" style="background:var(--accent)"></i>sortant replicator</span>
+          <span><i class="sw" style="background:var(--cyan)"></i>entrant bridge</span>
+        </span>
+      </h2>
+      <canvas id="cNet"></canvas>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Réglages d'émission</h2>
+    <div class="pad">
+      <div class="f3">
+        <div><label for="gh">Source GCP — hôte</label><input id="gh" placeholder="192.168.100.11"></div>
+        <div><label for="gp">Port</label><input id="gp" type="number" class="mono"></div>
+        <div><label for="wn">Demi-fenêtre (s)</label><input id="wn" type="number" min="1" class="mono"></div>
+      </div>
+      <div class="f2" style="margin-top:11px">
+        <div><label for="hz">Fréquence (Hz) — 0 = natif</label><input id="hz" type="number" step="0.5" min="0" class="mono"></div>
+        <div style="display:flex;align-items:flex-end">
+          <label class="chk"><input type="checkbox" id="allCh"> envoyer tous les channels</label>
+        </div>
+      </div>
+      <div style="margin-top:11px">
+        <label>Channels <code>needed</code></label>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <span class="mono" id="chCount" style="font-size:15px">—</span>
+          <a href="/channels"><button type="button">Choisir les channels</button></a>
+          <span class="note" style="margin:0">recherche, cases à cocher, import du filtre shore</span>
+        </div>
+      </div>
+      <div style="margin-top:11px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="p" id="save">Enregistrer</button>
+        <span id="saveMsg" class="note" style="margin:0"></span>
+      </div>
+      <p class="note">
+        La fenêtre, la fréquence et les channels sont relus à chaud — aucun redémarrage.
+        Changer la source GCP redémarre le bridge automatiquement.
+      </p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Logs <span class="filters" id="filters"></span></h2>
+    <div class="logs" id="logs"><div class="empty">en attente…</div></div>
+  </section>
+</main>
+
+<script>
+const MAX = 300;
+const S = {hist: [], logs: [], svcs: new Set(), hidden: new Set(), cfg: null, touched: false};
+const $ = i => document.getElementById(i);
+const fmtB = b => b >= 1e9 ? (b/1e9).toFixed(2)+' Go' : b >= 1e6 ? (b/1e6).toFixed(0)+' Mo'
+              : b >= 1e3 ? (b/1e3).toFixed(0)+' ko' : Math.round(b)+' o';
+const fmtR = b => b >= 1e6 ? (b/1e6).toFixed(2)+' Mo/s' : b >= 1e3 ? (b/1e3).toFixed(1)+' ko/s' : Math.round(b)+' o/s';
+const hhmmss = t => new Date(t*1000).toISOString().substr(11,8);
+const esc = s => s.replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;');
+
+let ws, retry = 0;
+function connect(){
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => { retry = 0; $('dot').classList.add('on'); };
+  ws.onclose = () => { $('dot').classList.remove('on'); setTimeout(connect, Math.min(1000*++retry, 8000)); };
+  ws.onmessage = e => {
+    const {type, data} = JSON.parse(e.data);
+    if (type === 'hello'){
+      S.hist = data.history || [];
+      $('boat').textContent = data.boat || 'B3';
+      (data.logs || []).forEach(addLog); renderLogs();
+      if (!S.touched) fillConfig(data.config);
+      renderToolkit(data.toolkit);
+      render();
+    } else if (type === 'sample'){
+      S.hist.push(data); if (S.hist.length > MAX) S.hist.shift();
+      render();
+    } else if (type === 'log'){ addLog(data); renderLogs(); }
+  };
+}
+function addLog(e){
+  S.logs.push(e); if (S.logs.length > 600) S.logs.shift();
+  if (!S.svcs.has(e.svc)){ S.svcs.add(e.svc); renderFilters(); }
+}
+
+// ── etat ────────────────────────────────────────────────────────────────────
+function tile(k,v,s){ return `<div class="tile"><div class="k">${k}</div><div class="v mono">${v}</div><div class="s mono">${s||'&nbsp;'}</div></div>`; }
+function render(){
+  const L = S.hist[S.hist.length-1]; if (!L) return;
+  const sy = L.system, pl = L.pipeline, r = L.rates || {};
+  const eg = (r.replicator||{}).tx_s || 0, ig = (r.bridge||{}).rx_s || 0;
+  const pc = (u,t) => t ? Math.round(u/t*100) : 0;
+  const up = (L.services||[]).filter(s => s.state === 'running').length;
+  $('clock').textContent = hhmmss(L.t) + ' UTC';
+  $('tiles').innerHTML =
+      tile('Émission', fmtR(eg), 'vers le shore')
+    + tile('File d\'attente', pl.queued, pl.pending_bytes ? 'reste à envoyer' : 'à jour')
+    + tile('Services actifs', up + ' / ' + (L.services||[]).length, '')
+    + tile('RAM carte', fmtB(sy.mem_used), pc(sy.mem_used, sy.mem_total) + ' % de ' + fmtB(sy.mem_total))
+    + tile('Swap', fmtB(sy.swap_used), sy.swap_used ? 'utilisé' : 'libre')
+    + tile('Disque', fmtB(sy.disk_used), pc(sy.disk_used, sy.disk_total) + ' %')
+    + tile('Entrant bateau', fmtR(ig), 'GCP → Influx');
+
+  const order = ['influxdb','bridge','detection','replicator'];
+  const byName = {}; (L.services||[]).forEach(s => byName[s.name] = s);
+  $('svcs').innerHTML = order.map(n => {
+    const s = byName[n] || {state:'absent', status:'absent'};
+    const run = s.state === 'running';
+    return `<div class="svc"><span class="nm">${n}</span>
+      <span class="st ${run?'run':'dead'}">${s.state||'?'}</span>
+      <span class="note mono" style="margin:0">${esc(s.status||'')}</span>
+      <span class="acts">
+        <button data-a="start" data-s="${n}" ${run?'disabled':''}>Allumer</button>
+        <button data-a="restart" data-s="${n}" ${run?'':'disabled'}>Redémarrer</button>
+        <button class="d" data-a="stop" data-s="${n}" ${run?'':'disabled'}>Éteindre</button>
+      </span></div>`;
+  }).join('');
+
+  const cols = ['--accent','--cyan','--accent','--cyan'];
+  const svcs = order.filter(n => (L.containers||{})[n]);
+  $('legMem').innerHTML = svcs.map((s,i) =>
+    `<span><i class="sw" style="background:var(${cols[i%2]});opacity:${i<2?1:.5}"></i>${s}</span>`).join('');
+  drawMem(svcs); drawNet();
+}
+
+// ── graphiques ──────────────────────────────────────────────────────────────
+function setup(cv){
+  const r = devicePixelRatio||1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w*r; cv.height = h*r;
+  const x = cv.getContext('2d'); x.setTransform(r,0,0,r,0,0); x.clearRect(0,0,w,h);
+  return {x,w,h};
+}
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+function axes(x,w,h,max,fmt){
+  x.strokeStyle = css('--grid'); x.fillStyle = css('--mut'); x.lineWidth = 1;
+  x.font = '10px ui-sans-serif,system-ui,sans-serif';
+  for (let i=0;i<=2;i++){
+    const y = Math.round(h-15-i*(h-23)/2)+.5;
+    x.beginPath(); x.moveTo(40,y); x.lineTo(w-6,y); x.stroke();
+    x.fillText(fmt(max*i/2), 3, y-2);
+  }
+}
+function line(x,w,h,vals,max,colour,alpha){
+  if (vals.length < 2) return;
+  const px = i => 40 + i*(w-46)/(MAX-1), py = v => h-15-(max ? (v/max)*(h-23) : 0);
+  x.globalAlpha = alpha||1; x.beginPath();
+  vals.forEach((v,i) => i ? x.lineTo(px(i),py(v)) : x.moveTo(px(i),py(v)));
+  x.strokeStyle = colour; x.lineWidth = 1.6; x.lineJoin = 'round'; x.stroke(); x.globalAlpha = 1;
+}
+function drawMem(svcs){
+  const cv = $('cMem'); if (!cv.clientWidth) return;
+  const {x,w,h} = setup(cv);
+  const data = svcs.map(s => S.hist.map(p => (p.containers[s]||{}).mem || 0));
+  const max = Math.max(1, ...data.flat())*1.15;
+  axes(x,w,h,max,fmtB);
+  data.forEach((d,i) => line(x,w,h,d,max, css(i%2 ? '--cyan' : '--accent'), i<2 ? 1 : .5));
+}
+function drawNet(){
+  const cv = $('cNet'); if (!cv.clientWidth) return;
+  const {x,w,h} = setup(cv);
+  const eg = S.hist.map(p => ((p.rates||{}).replicator||{}).tx_s || 0);
+  const ig = S.hist.map(p => ((p.rates||{}).bridge||{}).rx_s || 0);
+  const max = Math.max(1, ...eg, ...ig)*1.15;
+  axes(x,w,h,max,fmtR);
+  line(x,w,h,ig,max,css('--cyan')); line(x,w,h,eg,max,css('--accent'));
+}
+
+// ── pilotage ────────────────────────────────────────────────────────────────
+async function post(url, body){
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                             body: body ? JSON.stringify(body) : undefined});
+  if (!r.ok) throw new Error((await r.text()).slice(0,300));
+  return r.json();
+}
+$('svcs').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-a]'); if (!b) return;
+  const label = b.textContent;
+  b.disabled = true; b.textContent = '…';
+  try { await post('/api/power', {action:b.dataset.a, service:b.dataset.s}); }
+  catch (err) { alert('Échec : ' + err.message); }
+  finally { b.textContent = label; }
+});
+$('allOn').onclick = () => act('start', null, 'Tout allumer');
+$('allOff').onclick = () => {
+  if (confirm("Éteindre bridge, detection, replicator et InfluxDB ?\n\nLa télémétrie du bateau ne sera plus enregistrée pendant l'arrêt.")) act('stop', null, 'Tout éteindre');
+};
+async function act(action, service, label){
+  const b = action === 'start' ? $('allOn') : $('allOff');
+  b.disabled = true; b.textContent = '…';
+  try { await post('/api/power', {action, service}); }
+  catch (e) { alert('Échec : ' + e.message); }
+  finally { b.disabled = false; b.textContent = label; }
+}
+
+// ── bibliotheque ────────────────────────────────────────────────────────────
+function renderToolkit(tk){
+  if (!tk || !tk.available){ $('tk').innerHTML = '<span class="empty">version indisponible</span>'; return; }
+  const behind = tk.behind && +tk.behind > 0;
+  $('tk').innerHTML =
+    `<div class="f2"><div><label>Commit déployé</label><div class="mono">${esc(tk.commit||'?')}</div></div>
+     <div><label>Branche</label><div class="mono">${esc(tk.branch||'?')}</div></div></div>
+     <div style="margin-top:10px"><label>Dernier message</label><div>${esc(tk.subject||'—')}</div></div>
+     <div class="note">${esc((tk.date||'').slice(0,19))}${behind ? ' · <strong>'+tk.behind+' commit(s) de retard</strong>' : ' · à jour'}</div>`;
+  const w = $('tkWarn'); const msgs = [];
+  if (tk.update_blocked) msgs.push(`<strong>Mise à jour bloquée</strong> — ${esc(tk.update_blocked)}. ` +
+      `La console refusera de reculer : rien ne sera touché tant que ce n'est pas résolu.`);
+  if (tk.dirty_files > 0) msgs.push(`<strong>${tk.dirty_files} fichier(s) modifié(s) localement</strong> ` +
+      `dans le dépôt — la mise à jour refuserait de les écraser.`);
+  w.innerHTML = msgs.join('<br><br>');
+  w.style.display = msgs.length ? 'block' : 'none';
+  $('upd').disabled = !!tk.update_blocked;
+}
+$('upd').onclick = async () => {
+  if (!confirm("Récupérer la dernière version du toolkit et reconstruire les conteneurs ?\n\nLa détection et l'émission s'interrompent le temps de la reconstruction.")) return;
+  await startUpdate(false);
+};
+$('updFetch').onclick = () => startUpdate(true);
+async function startUpdate(fetchOnly){
+  try { await post('/api/update', {fetch_only: fetchOnly}); pollLog(); }
+  catch (e) { alert('Échec : ' + e.message); }
+}
+$('updLog').onclick = () => pollLog();
+async function pollLog(){
+  const box = $('updOut'); box.style.display = 'block';
+  for (let i = 0; i < 240; i++){
+    box.textContent = await (await fetch('/api/update/log')).text();
+    box.scrollTop = box.scrollHeight;
+    if (/# mise a jour terminee|# deja a jour|!! echec|a plante|recuperation seule/.test(box.textContent)) break;
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  const st = await (await fetch('/api/version')).json();
+  renderToolkit(st);
+}
+
+// ── reglages ────────────────────────────────────────────────────────────────
+function fillConfig(c){
+  if (!c) return;
+  S.cfg = c;
+  $('gh').value = c.gcp_host || ''; $('gp').value = c.gcp_port || '';
+  $('wn').value = c.window_s ?? 30; $('hz').value = c.hz ?? 0;
+  const all = !c.needed_channels || c.needed_channels.length === 0;
+  $('allCh').checked = all;
+  $('chCount').textContent = all ? 'tous les channels'
+                                 : (c.needed_channels || []).length + ' sélectionnés';
+}
+['gh','gp','wn','hz'].forEach(i => $(i).addEventListener('input', () => S.touched = true));
+$('allCh').addEventListener('change', () => { S.touched = true; });
+$('save').onclick = async () => {
+  const b = $('save'); b.disabled = true; b.textContent = '…';
+  try {
+    const r = await post('/api/config', {
+      window_s: +$('wn').value, hz: +$('hz').value,
+      gcp_host: $('gh').value.trim() || null, gcp_port: +$('gp').value || null,
+      all_channels: $('allCh').checked,
+      // La selection fine se fait sur /channels ; ici on ne fait que la reconduire.
+      needed_channels: (S.cfg && S.cfg.needed_channels) || [],
+    });
+    S.touched = false;
+    $('saveMsg').textContent = `Enregistré (version ${r.version})` + (r.bridge_restarted ? ' — bridge redémarré' : ' — appliqué à chaud');
+    setTimeout(() => $('saveMsg').textContent = '', 6000);
+  } catch (e) { alert('Échec : ' + e.message); }
+  finally { b.disabled = false; b.textContent = 'Enregistrer'; }
+};
+
+// ── logs ────────────────────────────────────────────────────────────────────
+function renderFilters(){
+  $('filters').innerHTML = [...S.svcs].sort().map(s =>
+    `<button data-s="${s}" aria-pressed="${!S.hidden.has(s)}">${s}</button>`).join('');
+}
+$('filters').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  S.hidden.has(b.dataset.s) ? S.hidden.delete(b.dataset.s) : S.hidden.add(b.dataset.s);
+  renderFilters(); renderLogs();
+});
+function renderLogs(){
+  const box = $('logs');
+  const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const rows = S.logs.filter(l => !S.hidden.has(l.svc));
+  box.innerHTML = rows.length ? rows.map(l =>
+    `<div class="${l.level}"><span class="ts">${hhmmss(l.t)}</span><span class="sv">${l.svc}</span><span class="m">${esc(l.msg)}</span></div>`
+  ).join('') : '<div class="empty">aucune ligne</div>';
+  if (stick) box.scrollTop = box.scrollHeight;
+}
+
+// ── theme : systeme par defaut, choix explicite memorise ────────────────────
+function applyTheme(t){
+  // "auto" ne pose aucun attribut : la page suit alors prefers-color-scheme.
+  if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', t);
+  [...$('theme').children].forEach(b => b.setAttribute('aria-pressed', b.dataset.t === t));
+  render();  // les graphiques lisent les couleurs dans le CSS : il faut les redessiner
+}
+$('theme').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try { localStorage.setItem('theme', b.dataset.t); } catch (_) {}
+  applyTheme(b.dataset.t);
+});
+let saved = 'auto';
+try { saved = localStorage.getItem('theme') || 'auto'; } catch (_) {}
+applyTheme(saved);
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => {
+  if (!document.documentElement.hasAttribute('data-theme')) render();
+});
+
+addEventListener('resize', render);
+connect();
+</script>
+</body>
+</html>

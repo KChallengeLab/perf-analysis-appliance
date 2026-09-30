@@ -1,0 +1,120 @@
+/* Charte K-Challenge — feuille partagee par toutes les pages de la console.
+   Editer ici et nulle part ailleurs : les pages ne portent que leurs specificites. */
+  /* Charte K-Challenge — memes couleurs et memes fontes que le rapport et la presentation.
+     Les polices sont servies par la carte (/fonts) : en mer le poste du bord n'a pas
+     forcement d'acces internet, et un repli sur Arial casserait l'identite. */
+  @font-face{font-family:'Inter';src:url('/fonts/Inter.ttf') format('truetype');
+             font-weight:100 900;font-display:swap}
+  @font-face{font-family:'Barlow Condensed';src:url('/fonts/BarlowCondensed-Regular.ttf') format('truetype');
+             font-weight:400;font-display:swap}
+  @font-face{font-family:'Barlow Condensed';src:url('/fonts/BarlowCondensed-Bold.ttf') format('truetype');
+             font-weight:700;font-display:swap}
+  @font-face{font-family:'Barlow Condensed';src:url('/fonts/BarlowCondensed-ExtraBold.ttf') format('truetype');
+             font-weight:800;font-display:swap}
+  @font-face{font-family:'JetBrains Mono';src:url('/fonts/JetBrainsMono.ttf') format('truetype');
+             font-weight:400 600;font-display:swap}
+
+  :root{
+    /* Clair — la palette du rapport (style-rapport.sty) */
+    --bg:#ffffff; --panel:#f2f6fa; --sunk:#e9eff5; --line:#d3dde6;
+    --ink:#0b1622; --mut:#4d5a68; --faint:#7b8794;
+    --accent:#0074cc; --ok:#1f8a4c; --warn:#b3700a; --err:#c0392b; --cyan:#0093ad;
+    --grid:#e4ebf1;
+    --sans:'Inter',system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --cond:'Barlow Condensed','Inter',system-ui,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  /* Sombre — la palette de la presentation (soutenance.html).
+     Defini deux fois : sous prefers-color-scheme pour l'etat "systeme" (aucun attribut pose),
+     et sous [data-theme="dark"] pour que le choix explicite de l'utilisateur l'emporte. */
+  @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+    --bg:#060d19; --panel:#0a1422; --sunk:#0d1828; --line:rgba(255,255,255,.12);
+    --ink:#ffffff; --mut:rgba(255,255,255,.70); --faint:rgba(255,255,255,.45);
+    --accent:#0091ff; --ok:#2ecc71; --warn:#f59e0b; --err:#ef4444; --cyan:#00d4ff;
+    --grid:rgba(255,255,255,.07);
+  }}
+  :root[data-theme="dark"]{
+    --bg:#060d19; --panel:#0a1422; --sunk:#0d1828; --line:rgba(255,255,255,.12);
+    --ink:#ffffff; --mut:rgba(255,255,255,.70); --faint:rgba(255,255,255,.45);
+    --accent:#0091ff; --ok:#2ecc71; --warn:#f59e0b; --err:#ef4444; --cyan:#00d4ff;
+    --grid:rgba(255,255,255,.07);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.5 var(--sans)}
+  /* Etiquette de section : condensee, capitales, tres espacee — le \kicker du rapport. */
+  .kicker{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.22em;
+          text-transform:uppercase;color:var(--accent)}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 18px;
+         border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  h1{font-family:var(--cond);font-weight:800;font-size:19px;margin:0;letter-spacing:.02em;
+     text-transform:uppercase}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--err);flex:none}
+  .dot.on{background:var(--ok)}
+  .grow{flex:1}
+  .mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  main{padding:15px;display:grid;gap:14px;max-width:1480px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .panel>h2{font-family:var(--cond);font-weight:700;font-size:12.5px;margin:0;padding:10px 14px;
+            border-bottom:1px solid var(--line);color:var(--accent);text-transform:uppercase;
+            letter-spacing:.2em;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .pad{padding:13px}
+  .row{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+  .tiles{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+  .tile{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:10px 12px}
+  .tile .k{font-family:var(--cond);font-weight:700;color:var(--mut);font-size:11px;
+           text-transform:uppercase;letter-spacing:.15em}
+  .tile .v{font-family:var(--cond);font-weight:800;font-size:29px;line-height:1.05;
+           margin-top:3px;color:var(--accent);font-variant-numeric:tabular-nums}
+  .tile .s{font-family:var(--mono);color:var(--faint);font-size:10.5px}
+  button{font-family:var(--cond);font-weight:700;font-size:13px;letter-spacing:.09em;
+         text-transform:uppercase;border-radius:6px;border:1px solid var(--line);
+         background:transparent;color:var(--ink);padding:5px 12px;cursor:pointer}
+  button:hover:not(:disabled){border-color:var(--mut)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
+  button.p{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.d{background:transparent;border-color:var(--err);color:var(--err)}
+  .svc{display:flex;align-items:center;gap:9px;padding:8px 13px;border-bottom:1px solid var(--line)}
+  .svc:last-child{border-bottom:none}
+  .svc .nm{font-family:var(--mono);font-weight:600;width:100px;flex:none}
+  .svc .st{font-family:var(--cond);font-weight:700;font-size:11.5px;letter-spacing:.12em;
+           text-transform:uppercase;padding:1px 9px;border-radius:99px;
+           border:1px solid var(--line);color:var(--mut)}
+  .svc .st.run{color:var(--ok);border-color:var(--ok)}
+  .svc .st.dead{color:var(--err);border-color:var(--err)}
+  .svc .acts{margin-left:auto;display:flex;gap:5px}
+  canvas{display:block;width:100%;height:132px}
+  .legend{display:flex;gap:10px;margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400}
+  .legend span{display:flex;align-items:center;gap:4px}
+  .sw{width:9px;height:3px;border-radius:2px;display:inline-block}
+  label{display:block;font-family:var(--cond);font-weight:700;color:var(--mut);font-size:11.5px;
+        text-transform:uppercase;letter-spacing:.15em;margin-bottom:4px}
+  input,textarea{font:inherit;width:100%;padding:6px 9px;border-radius:7px;border:1px solid var(--line);
+                 background:var(--sunk);color:var(--ink)}
+  textarea{font-family:var(--mono);font-size:11px;min-height:96px;resize:vertical}
+  .f2{display:grid;gap:11px;grid-template-columns:1fr 1fr}
+  .f3{display:grid;gap:11px;grid-template-columns:2fr 1fr 1fr}
+  .chk{display:flex;align-items:center;gap:7px;color:var(--ink);font-size:12.5px;text-transform:none;letter-spacing:0}
+  .chk input{width:auto}
+  pre{margin:0;padding:11px 13px;background:var(--sunk);overflow:auto;max-height:230px;
+      font:11px/1.55 var(--mono);white-space:pre-wrap;color:var(--mut)}
+  .logs{height:290px;overflow:auto;font:11.5px/1.6 var(--mono);padding:7px 0}
+  .logs div{padding:1px 13px;display:flex;gap:9px;border-left:2px solid transparent}
+  .logs .ts,.logs .sv{color:var(--mut);flex:none}
+  .logs .sv{width:72px}
+  .logs .m{white-space:pre-wrap;word-break:break-word;min-width:0}
+  .logs .WARNING{border-left-color:var(--warn)} .logs .WARNING .m{color:var(--warn)}
+  .logs .ERROR{border-left-color:var(--err)} .logs .ERROR .m{color:var(--err)}
+  .filters{display:flex;gap:5px;flex-wrap:wrap;text-transform:none;letter-spacing:0}
+  .filters button{font-size:11px;padding:1px 9px;border-radius:11px;color:var(--mut);letter-spacing:.1em}
+  .filters button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+  .note{color:var(--mut);font-size:11.5px;margin-top:8px}
+  .warnbox{margin:0 13px 13px;padding:9px 11px;border-radius:7px;border:1px solid var(--warn);
+           color:var(--warn);font-size:11.5px;display:none}
+  .empty{padding:22px;color:var(--faint);text-align:center}
+  /* Selecteur de theme : systeme / clair / sombre */
+  .theme{display:flex;gap:0;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .theme button{border:none;border-radius:0;padding:3px 9px;font-size:11px;color:var(--mut);
+                background:transparent;letter-spacing:.1em}
+  .theme button[aria-pressed="true"]{background:var(--accent);color:#fff}

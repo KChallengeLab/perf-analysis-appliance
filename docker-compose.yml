@@ -16,6 +16,8 @@ services:
   # InfluxDB MUST be a Linux container (Influx-on-Windows is unstable). Docker Desktop / WSL2.
   influxdb:
     image: influxdb:2.7
+    mem_limit: 768m
+    memswap_limit: 768m
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USERNAME:-admin}
@@ -23,6 +25,9 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-metrics-org}
       DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-B3-CIS-TEST}
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?set INFLUX_TOKEN in .env}
+      # Bornage memoire: plafond du cache d'ecriture avant snapshot disque (defaut 1g).
+      INFLUXD_STORAGE_CACHE_MAX_MEMORY_SIZE: "268435456"
+      INFLUXD_STORAGE_CACHE_SNAPSHOT_MEMORY_SIZE: "26214400"
       # Retention left infinite here; the spec keeps "the current day" + nightly .db, purge on demand.
     volumes:
       - influx-data:/var/lib/influxdb2
@@ -40,6 +45,12 @@ services:
   # bridge will replace it later (and --no-filter will become the Hub manifest filter, Phase 2).
   bridge:
     <<: *toolkit
+    mem_limit: 384m
+    memswap_limit: 384m
+    # Le flux GCP arrive par un tunnel SSH inverse lie a 127.0.0.1 de l'hote ; un relais socat
+    # (service gcp-relay) le republie sur docker0 pour que le conteneur puisse l'atteindre.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       influxdb:
         condition: service_healthy
@@ -69,6 +80,8 @@ services:
   # Detection + inline analysis (one process). POIs → Neon, analyses written in the same process.
   detection:
     <<: *toolkit
+    mem_limit: 1g
+    memswap_limit: 1g
     depends_on:
       influxdb:
         condition: service_healthy
@@ -101,8 +114,13 @@ services:
 
   # Shore InfluxDB — the replicator's egress destination. In the test rig it's a 2nd local
   # container; on the boat, set SHORE_INFLUX_URL to the real shore Influx (hostname) and drop this.
+  # Faux shore, utile seulement hors bateau : `docker compose --profile testshore up`.
+  # Sur le bateau on vise le vrai shore via SHORE_INFLUX_URL, ce conteneur ne demarre pas.
   shore-influxdb:
     image: influxdb:2.7
+    profiles: ["testshore"]
+    mem_limit: 256m
+    memswap_limit: 256m
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USERNAME:-admin}
@@ -110,6 +128,9 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: ${SHORE_INFLUX_ORG:-metrics-org}
       DOCKER_INFLUXDB_INIT_BUCKET: ${SHORE_INFLUX_BUCKET:-B3-CIS-TEST}
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${SHORE_INFLUX_TOKEN:?set SHORE_INFLUX_TOKEN in .env}
+      # Bornage memoire: plafond du cache d'ecriture avant snapshot disque (defaut 1g).
+      INFLUXD_STORAGE_CACHE_MAX_MEMORY_SIZE: "268435456"
+      INFLUXD_STORAGE_CACHE_SNAPSHOT_MEMORY_SIZE: "26214400"
     volumes:
       - shore-influx-data:/var/lib/influxdb2
     ports:
@@ -124,10 +145,12 @@ services:
   # Replicator: per-manoeuvre ±30s window from local Influx → shore Influx. Outbound, idempotent.
   replicator:
     <<: *toolkit
+    # 384m ne suffit pas : une fenetre +/-30s non filtree charge ~4,6M points dans pandas
+    # (le cgroup l'a tue). Avec needed_channels + downsample c'est large, la marge reste utile.
+    mem_limit: 768m
+    memswap_limit: 768m
     depends_on:
       influxdb:
-        condition: service_healthy
-      shore-influxdb:
         condition: service_healthy
     environment:
       ONBOARD_BOAT: ${ONBOARD_BOAT:-B3}
@@ -158,17 +181,26 @@ services:
       - spool:/spool
       - config:/config
 
-  # Control panel — browser UI on :4267 to tune the egress (window / Hz / needed channels, live)
-  # and update the toolkit from GitHub. Talks to Docker via the mounted socket.
+  # Console — l'unique interface de gestion de la carte, sur :4267 : allumage/extinction des
+  # services, suivi live (ressources, bande passante, logs) pousse par WebSocket, reglages
+  # d'emission relus a chaud, et mise a jour du toolkit depuis GitHub.
+  # Parle a Docker via le socket monte : root-equivalent sur l'hote, a garder sur un LAN sur.
   control:
     build:
       context: ./control
     image: perf-analysis-control:latest
+    mem_limit: 256m
+    memswap_limit: 256m
     restart: unless-stopped
     environment:
       ONBOARD_BOAT: ${ONBOARD_BOAT:-B3}
       CONFIG_PATH: /config/appliance.json
       SPOOL_DIR: /spool
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-perf-analysis-appliance}
+      # Catalogue de channels : l'editeur du shore (perf-nav :4444) fait foi. La console va le
+      # chercher elle-meme et le met en cache — le navigateur du bord n'a pas a joindre le shore.
+      SHORE_CHANNELS_URL: ${SHORE_CHANNELS_URL:-}
+      SHORE_CHANNELS_TOKEN: ${SHORE_CHANNELS_TOKEN:-}
       # Host paths so `docker compose` (run here) sends the daemon valid build-context paths.
       # HOST_PROJECT_DIR = this appliance repo's dir (holds the compose + the toolkit submodule).
       COMPOSE_FILE: ${HOST_PROJECT_DIR:?set HOST_PROJECT_DIR in .env}/docker-compose.yml

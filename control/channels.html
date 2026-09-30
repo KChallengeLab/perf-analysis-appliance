@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channels — Onboard Data Analysis Console</title>
+<link rel="stylesheet" href="/console.css">
+<style>
+  /* Specifique a cette page : la liste et sa colonne de recherche. */
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 14px;
+       border-bottom:1px solid var(--line);position:sticky;top:47px;background:var(--panel);z-index:4}
+  .bar input[type="search"]{flex:1;min-width:220px;max-width:460px}
+  .cnt{font-family:var(--cond);font-weight:800;font-size:24px;color:var(--accent);
+       font-variant-numeric:tabular-nums;line-height:1}
+  .cnt small{font-family:var(--cond);font-weight:700;font-size:11px;letter-spacing:.15em;
+             color:var(--mut);text-transform:uppercase;display:block;margin-top:1px}
+  .grp{border-bottom:1px solid var(--line)}
+  .grp:last-child{border-bottom:none}
+  .grp>summary{cursor:pointer;padding:9px 14px;display:flex;align-items:center;gap:10px;
+               font-family:var(--mono);font-size:12px;list-style:none}
+  .grp>summary::-webkit-details-marker{display:none}
+  .grp>summary::before{content:"▸";color:var(--mut);font-family:var(--sans);width:10px}
+  .grp[open]>summary::before{content:"▾"}
+  .grp>summary:hover{background:var(--sunk)}
+  .grp .tag{font-family:var(--cond);font-weight:700;font-size:11px;letter-spacing:.12em;
+            text-transform:uppercase;color:var(--mut);margin-left:auto}
+  .grp .tag b{color:var(--accent)}
+  .items{display:grid;gap:1px 16px;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
+         padding:4px 14px 12px 34px}
+  /* Ce sont des <label>, donc ils heriteraient du text-transform:uppercase de la charte.
+     Or la casse d'un nom de channel est significative : Boat.TWA n'est pas BOAT.TWA. */
+  .ch{display:flex;align-items:center;gap:8px;padding:2px 4px;border-radius:5px;cursor:pointer;
+      font-family:var(--mono);font-size:11.5px;color:var(--mut);min-width:0;
+      text-transform:none;letter-spacing:0;font-weight:400;margin-bottom:0}
+  .ch:hover{background:var(--sunk)}
+  .ch input{width:auto;flex:none}
+  .ch span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .ch.on{color:var(--ink)}
+  .ch mark{background:transparent;color:var(--accent);font-weight:600}
+  .msg{padding:10px 14px;font-size:11.5px;color:var(--mut);border-bottom:1px solid var(--line)}
+  .msg.err{color:var(--err)}
+  a.back{color:var(--accent);text-decoration:none;font-family:var(--cond);font-weight:700;
+         letter-spacing:.12em;text-transform:uppercase;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/">← Console</a>
+  <h1>Channels</h1>
+  <span class="grow"></span>
+  <span class="theme" id="theme" role="group" aria-label="Theme">
+    <button data-t="auto">Auto</button><button data-t="light">Clair</button><button data-t="dark">Sombre</button>
+  </span>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="bar">
+      <span class="cnt"><span id="nsel">—</span><small>sélectionnés</small></span>
+      <input type="search" id="q" placeholder="Rechercher un channel…  (ex. TWA, Foil, Rig)" spellcheck="false">
+      <button id="selAll">Tout cocher</button>
+      <button id="selNone">Tout décocher</button>
+      <span class="grow"></span>
+      <button id="fetch">Importer le filtre du shore</button>
+      <button class="p" id="save">Enregistrer</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div id="list"><div class="empty">chargement…</div></div>
+  </section>
+</main>
+
+<script>
+const $ = i => document.getElementById(i);
+const esc = s => s.replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;');
+const S = {tables: {}, selected: new Set(), cfg: null, q: ''};
+
+// ── theme (identique a la console) ──────────────────────────────────────────
+function applyTheme(t){
+  if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', t);
+  [...$('theme').children].forEach(b => b.setAttribute('aria-pressed', b.dataset.t === t));
+}
+$('theme').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try { localStorage.setItem('theme', b.dataset.t); } catch (_) {}
+  applyTheme(b.dataset.t);
+});
+try { applyTheme(localStorage.getItem('theme') || 'auto'); } catch (_) { applyTheme('auto'); }
+
+// ── donnees ─────────────────────────────────────────────────────────────────
+async function load(){
+  const [cat, cfg] = await Promise.all([
+    fetch('/api/channels/catalog').then(r => r.json()),
+    fetch('/api/config').then(r => r.json()),
+  ]);
+  S.cfg = cfg;
+  S.tables = cat.tables && Object.keys(cat.tables).length
+    ? cat.tables
+    : {'sélection actuelle': cat.channels};   // pas encore de catalogue shore
+  S.selected = new Set(cat.selected || []);
+  const when = cat.fetched_at
+    ? `Catalogue du shore récupéré le ${cat.fetched_at.replace('T', ' à ').replace('Z', ' UTC')}.`
+    : (cat.configured
+        ? "Aucun catalogue local pour l'instant — clique « Importer le filtre du shore »."
+        : "SHORE_CHANNELS_URL n'est pas configuré sur la carte : import indisponible, tu peux quand même cocher/décocher la sélection existante.");
+  msg(when);
+  render();
+}
+function msg(t, err){ const m = $('msg'); m.textContent = t; m.className = 'msg' + (err ? ' err' : ''); }
+
+// ── rendu ───────────────────────────────────────────────────────────────────
+function match(name){ return !S.q || name.toLowerCase().includes(S.q); }
+function hl(name){
+  if (!S.q) return esc(name);
+  const i = name.toLowerCase().indexOf(S.q);
+  return esc(name.slice(0, i)) + '<mark>' + esc(name.slice(i, i + S.q.length)) + '</mark>' + esc(name.slice(i + S.q.length));
+}
+function render(){
+  const names = Object.keys(S.tables).sort();
+  let html = '', shown = 0;
+  for (const t of names){
+    const all = S.tables[t] || [];
+    const vis = all.filter(match);
+    if (!vis.length) continue;
+    shown += vis.length;
+    const on = all.filter(c => S.selected.has(c)).length;
+    html += `<details class="grp"${S.q ? ' open' : (on ? ' open' : '')}>
+      <summary>${esc(t)}
+        <span class="tag"><b>${on}</b> / ${all.length}${S.q ? ` · ${vis.length} trouvé(s)` : ''}</span>
+      </summary>
+      <div class="items">` +
+      vis.map(c => `<label class="ch${S.selected.has(c) ? ' on' : ''}">
+          <input type="checkbox" data-c="${esc(c)}"${S.selected.has(c) ? ' checked' : ''}>
+          <span title="${esc(c)}">${hl(c)}</span></label>`).join('') +
+      `</div></details>`;
+  }
+  $('list').innerHTML = html || `<div class="empty">aucun channel ne correspond à « ${esc(S.q)} »</div>`;
+  $('nsel').textContent = S.selected.size;
+}
+
+// Delegation : la liste est reconstruite a chaque frappe, on ne peut pas lier chaque case.
+$('list').addEventListener('change', e => {
+  const b = e.target.closest('input[type="checkbox"]'); if (!b) return;
+  b.checked ? S.selected.add(b.dataset.c) : S.selected.delete(b.dataset.c);
+  b.closest('.ch').classList.toggle('on', b.checked);
+  const grp = b.closest('.grp');
+  const t = grp.querySelector('summary').firstChild.textContent.trim();
+  const all = S.tables[t] || [];
+  grp.querySelector('.tag b').textContent = all.filter(c => S.selected.has(c)).length;
+  $('nsel').textContent = S.selected.size;
+});
+
+let deb;
+$('q').addEventListener('input', e => {
+  clearTimeout(deb);
+  deb = setTimeout(() => { S.q = e.target.value.trim().toLowerCase(); render(); }, 120);
+});
+
+// Tout cocher / decocher n'agit que sur ce qui est VISIBLE : avec une recherche active,
+// c'est le seul comportement qui ne surprenne pas.
+$('selAll').onclick = () => { forVisible(c => S.selected.add(c)); render(); };
+$('selNone').onclick = () => { forVisible(c => S.selected.delete(c)); render(); };
+function forVisible(fn){ Object.values(S.tables).forEach(l => l.filter(match).forEach(fn)); }
+
+$('fetch').onclick = async () => {
+  const b = $('fetch'); const t = b.textContent; b.disabled = true; b.textContent = '…';
+  try {
+    const r = await fetch('/api/channels/refresh', {method: 'POST'});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'échec');
+    msg(`Filtre du shore importé : ${d.count} channels, ${d.tables} tables.`);
+    await load();
+  } catch (e) { msg('Import impossible — ' + e.message, true); }
+  finally { b.disabled = false; b.textContent = t; }
+};
+
+$('save').onclick = async () => {
+  const b = $('save'); b.disabled = true; b.textContent = '…';
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        window_s: S.cfg.window_s, hz: S.cfg.hz,
+        gcp_host: S.cfg.gcp_host || null, gcp_port: S.cfg.gcp_port || null,
+        all_channels: S.selected.size === 0,
+        needed_channels: [...S.selected].sort(),
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'échec');
+    msg(`Enregistré (version ${d.version}) — ${S.selected.size} channels, appliqué à chaud.`);
+  } catch (e) { msg('Enregistrement impossible — ' + e.message, true); }
+  finally { b.disabled = false; b.textContent = 'Enregistrer'; }
+};
+
+load().catch(e => msg('Chargement impossible — ' + e.message, true));
+</script>
+</body>
+</html>
