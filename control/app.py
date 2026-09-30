@@ -203,7 +203,7 @@ def channels_catalog():
         "fetched_at": cat.get("fetched_at"),
         "source": cat.get("source"),
         "variant": cat.get("variant"),
-        "configured": bool(SHORE_CHANNELS_URL),
+        "configured": bool(_env("SHORE_CHANNELS_URL")),
     }
 
 
@@ -211,14 +211,18 @@ def channels_catalog():
 def channels_refresh(source: str = "real"):
     """Va relire un filtre du shore (source=real : vrai bateau, sim : simulateur) et le met en
     cache localement."""
-    if source not in CHANNEL_SOURCES:
+    # Relu dans le .env a chaque appel : editable depuis /config sans redemarrer la console.
+    real = _env("SHORE_CHANNELS_URL")
+    sources = {"real": real, "sim": _env("SHORE_CHANNELS_URL_SIM") or re.sub(r"/([^/]+)/channels\.json", r"/\1sim/channels.json", real)}
+    token = _env("SHORE_CHANNELS_TOKEN")
+    if source not in sources:
         raise HTTPException(400, f"source inconnue '{source}' (real ou sim)")
-    if not CHANNEL_SOURCES[source]:
+    if not sources[source]:
         raise HTTPException(400, "SHORE_CHANNELS_URL n'est pas configure sur la carte")
-    src_url = CHANNEL_SOURCES[source]
+    src_url = sources[source]
     url = src_url
-    if SHORE_CHANNELS_TOKEN:
-        url += ("&" if "?" in url else "?") + "token=" + SHORE_CHANNELS_TOKEN
+    if token:
+        url += ("&" if "?" in url else "?") + "token=" + token
     try:
         import urllib.request
         with urllib.request.urlopen(url, timeout=30) as r:
@@ -242,6 +246,185 @@ def channels_refresh(source: str = "real"):
     tmp.write_text(json.dumps(cat), encoding="utf-8")
     tmp.replace(CATALOG_PATH)
     return {"ok": True, "variant": source, "toml": cat["toml"], "count": cat["count"], "tables": len(cat["tables"]), "fetched_at": cat["fetched_at"]}
+
+
+# ── config : choix d'analyse (Neon) + connexions (.env) ──────────────────────
+# Les connexions vivent dans le .env du projet (monte ici au meme chemin que sur l'hote) ;
+# docker compose les relit a chaque `up`, donc changer une valeur = recreer les services qui
+# l'utilisent. Les choix d'analyse (target, ref target, channel config, analysis configs)
+# vivent dans le config JSON et sont lus par la detection a son demarrage.
+
+PROJECT_DIR = Path(os.path.dirname(COMPOSE_FILE)) if COMPOSE_FILE else None
+ENV_PATH = PROJECT_DIR / ".env" if PROJECT_DIR else None
+NEON_CATALOG_PATH = CONFIG_PATH.parent / "neon_catalog.json"
+NEON_DB_VAR = "AC75_ONBOARD_TEST_POSTGRES_URL"  # nom fige dans le compose (--database=...)
+ANALYSIS_KEYS = ("target_name", "ref_target_name", "channel_config_name", "analysis_config_ids")
+
+# (groupe, cle, libelle, services a recreer, remarque)
+ENV_FIELDS = [
+    ("Neon (POIs + analyses)", NEON_DB_VAR, "URL Postgres", ["detection"], "La base ou la detection ecrit, et ou le catalogue d'analyse est lu."),
+    ("Bateau", "ONBOARD_BOAT", "Nom du bateau", ["detection", "replicator", "control"], "Doit exister dans la table boats de Neon."),
+    ("Bateau", "USERNAME", "Auteur des ecritures", ["detection"], "created_by / updated_by dans Neon."),
+    ("Influx local", "INFLUX_BUCKET", "Bucket", ["bridge", "detection", "replicator"], "Le bucket doit exister dans l'Influx local (cree au premier demarrage seulement)."),
+    ("Influx local", "INFLUX_ORG", "Org", ["bridge", "detection", "replicator"], "Idem : fixee a la creation du volume Influx."),
+    ("Influx local", "INFLUX_TOKEN", "Token", ["bridge", "detection", "replicator"], "Token admin fixe a la creation du volume : le changer ici ne change pas celui d'Influx."),
+    ("Influx shore (egress)", "SHORE_INFLUX_URL", "URL", ["replicator"], "Destination des fenetres de manoeuvre."),
+    ("Influx shore (egress)", "SHORE_INFLUX_ORG", "Org", ["replicator"], ""),
+    ("Influx shore (egress)", "SHORE_INFLUX_BUCKET", "Bucket", ["replicator"], ""),
+    ("Influx shore (egress)", "SHORE_INFLUX_TOKEN", "Token", ["replicator"], ""),
+    ("Catalogue de channels (perf-nav)", "SHORE_CHANNELS_URL", "URL Real", [], "Relu a chaque Fetch, sans redemarrage."),
+    ("Catalogue de channels (perf-nav)", "SHORE_CHANNELS_URL_SIM", "URL Sim", [], "Vide = deduite de l'URL Real (/ac75/ -> /ac75sim/)."),
+    ("Catalogue de channels (perf-nav)", "SHORE_CHANNELS_TOKEN", "Token", [], ""),
+]
+_ENV_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+
+
+def _read_env() -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if ENV_PATH and ENV_PATH.exists():
+        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+            m = _ENV_LINE.match(line)
+            if m and not line.lstrip().startswith("#"):
+                out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _env(key: str, default: str = "") -> str:
+    """Valeur courante : le .env fait foi (edite depuis la console), l'environnement sinon."""
+    return _read_env().get(key) or os.getenv(key, default)
+
+
+def _write_env(changes: Dict[str, str]):
+    """Met a jour les cles en gardant l'ordre, les commentaires et le reste du fichier."""
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+    done = set()
+    for i, line in enumerate(lines):
+        m = _ENV_LINE.match(line)
+        if m and not line.lstrip().startswith("#") and m.group(1) in changes:
+            lines[i] = f"{m.group(1)}={changes[m.group(1)]}"
+            done.add(m.group(1))
+    lines += [f"{k}={v}" for k, v in changes.items() if k not in done]
+    backup = ENV_PATH.with_name(".env.bak-" + time.strftime("%Y%m%d-%H%M%S"))
+    if ENV_PATH.exists():
+        backup.write_text(ENV_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    tmp = ENV_PATH.with_name(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(ENV_PATH)
+    return backup.name
+
+
+def _running() -> set:
+    return {s["name"] for s in _services() if s["state"] == "running"}
+
+
+class EnvIn(BaseModel):
+    values: Dict[str, str]
+
+
+@app.get("/api/env")
+def env_get():
+    if not ENV_PATH:
+        raise HTTPException(400, "COMPOSE_FILE absent : .env introuvable depuis la console")
+    cur = _read_env()
+    return {
+        "path": str(ENV_PATH),
+        "fields": [{"group": g, "key": k, "label": l, "services": s, "note": n, "value": cur.get(k, "")} for g, k, l, s, n in ENV_FIELDS],
+    }
+
+
+@app.post("/api/env")
+def env_set(body: EnvIn):
+    if not ENV_PATH:
+        raise HTTPException(400, "COMPOSE_FILE absent : .env introuvable depuis la console")
+    allowed = {k: svc for _, k, _, svc, _ in ENV_FIELDS}
+    unknown = sorted(set(body.values) - set(allowed))
+    if unknown:
+        raise HTTPException(400, f"cles non editables ici : {unknown}")
+    cur = _read_env()
+    changes = {k: v.strip() for k, v in body.values.items() if v.strip() != cur.get(k, "")}
+    bad = [k for k, v in changes.items() if "\n" in v or "\r" in v]
+    if bad:
+        raise HTTPException(400, f"valeur sur plusieurs lignes refusee : {bad}")
+    if not changes:
+        return {"ok": True, "changed": [], "recreated": [], "backup": None}
+    backup = _write_env(changes)
+    # Recreer seulement les services concernes ET en marche : une stack eteinte le reste, et
+    # la console ne se recree pas elle-meme en pleine requete (ses cles sont relues a chaud).
+    wanted = sorted({s for k in changes for s in allowed[k]} & _running() - {"control"})
+    if wanted:
+        r = _compose("up", "-d", "--no-deps", *wanted, timeout=300)
+        if r.returncode != 0:
+            raise HTTPException(500, f".env ecrit (sauvegarde {backup}) mais la recreation a echoue : {r.stderr[-400:]}")
+    return {"ok": True, "changed": sorted(changes), "recreated": wanted, "backup": backup,
+            "control_restart_needed": any("control" in allowed[k] for k in changes)}
+
+
+def _load_neon_catalog() -> dict:
+    try:
+        return json.loads(NEON_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+@app.get("/api/analysis")
+def analysis_get():
+    cfg = _load_config()
+    return {"catalog": _load_neon_catalog(), "current": {k: cfg.get(k) for k in ANALYSIS_KEYS}}
+
+
+@app.post("/api/analysis/refresh")
+def analysis_refresh():
+    """Relit dans Neon targets / analysis configs / channel configs (image du toolkit, ~20 s)."""
+    r = _compose("run", "--rm", "--no-deps", "-T", "detection", "python", "-m", "sailing_data_toolkit.workers.onboard_catalog",
+                 "--database", NEON_DB_VAR, timeout=240)
+    line = next((l for l in reversed(r.stdout.splitlines()) if l.startswith("{")), None)
+    if r.returncode != 0 or not line:
+        raise HTTPException(502, f"lecture Neon impossible : {(r.stderr or r.stdout)[-500:]}")
+    cat = json.loads(line)
+    cat["fetched_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    tmp = NEON_CATALOG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cat), encoding="utf-8")
+    tmp.replace(NEON_CATALOG_PATH)
+    return {"ok": True, "targets": len(cat.get("targets", [])), "analysis_configs": len(cat.get("analysis_configs", [])), "fetched_at": cat["fetched_at"]}
+
+
+class AnalysisIn(BaseModel):
+    target_name: str | None = None
+    ref_target_name: str | None = None
+    channel_config_name: str | None = None
+    analysis_config_ids: Dict[str, int | None] = {}
+
+
+@app.post("/api/analysis")
+def analysis_set(body: AnalysisIn):
+    cfg = _load_config()
+    for k in ("target_name", "ref_target_name", "channel_config_name"):
+        v = (getattr(body, k) or "").strip()
+        if v:
+            cfg[k] = v
+        else:
+            cfg.pop(k, None)  # absent = defaut du profil
+    ids = {t: int(i) for t, i in (body.analysis_config_ids or {}).items() if i}
+    if ids:
+        cfg["analysis_config_ids"] = ids
+    else:
+        cfg.pop("analysis_config_ids", None)
+    cfg["version"] = int(cfg.get("version", 0)) + 1
+    _write_config(cfg)
+    # La detection ne lit ces choix qu'au demarrage. On la RECREE (pas un simple restart, qui
+    # garderait l'ancienne image et l'ancienne config du conteneur apres une mise a jour).
+    restarted = "detection" in _running()
+    if restarted:
+        r = _compose("up", "-d", "--no-deps", "--force-recreate", "detection", timeout=300)
+        if r.returncode != 0:
+            raise HTTPException(500, f"choix enregistres mais la detection n'a pas redemarre : {r.stderr[-400:]}")
+    return {"ok": True, "version": cfg["version"], "detection_restarted": restarted}
+
+
+@app.get("/config", response_class=HTMLResponse)
+def config_page():
+    return (APP_DIR / "config.html").read_text(encoding="utf-8")
+
 
 
 @app.get("/channels", response_class=HTMLResponse)

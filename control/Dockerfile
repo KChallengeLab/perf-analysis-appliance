@@ -25,7 +25,7 @@ RUN set -eux; \
 RUN pip install "fastapi>=0.115,<1" "uvicorn[standard]>=0.30,<1" "pydantic>=2.7,<3"
 
 WORKDIR /app
-COPY app.py index.html channels.html console.css default_channels.json ./
+COPY app.py index.html channels.html config.html console.css default_channels.json ./
 # Polices de la charte, servies par la carte : le poste du bord n'a pas forcement
 # d'acces internet, et un repli silencieux sur Arial casserait l'identite.
 COPY fonts ./fonts

@@ -100,6 +100,8 @@ services:
       AC75_ONBOARD_TEST_POSTGRES_URL: ${AC75_ONBOARD_TEST_POSTGRES_URL:?set AC75_ONBOARD_TEST_POSTGRES_URL in .env}
       # Local egress queue: detected manoeuvres are appended here for the replicator to drain.
       ONBOARD_EGRESS_SPOOL: /spool
+      # Analysis choices saved by the console (target, ref target, channel config, analysis configs).
+      ONBOARD_CONFIG: /config/appliance.json
     command:
       - python
       - -m
@@ -111,6 +113,7 @@ services:
       - --database=AC75_ONBOARD_TEST_POSTGRES_URL
     volumes:
       - spool:/spool
+      - config:/config:ro
 
   # Shore InfluxDB — the replicator's egress destination. In the test rig it's a 2nd local
   # container; on the boat, set SHORE_INFLUX_URL to the real shore Influx (hostname) and drop this.

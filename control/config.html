@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Config — YODA</title>
+<link rel="stylesheet" href="/console.css">
+<style>
+  .msg{padding:10px 14px;font-size:11.5px;color:var(--mut);border-bottom:1px solid var(--line)}
+  .msg.err{color:var(--err)}
+  .msg.ok{color:var(--accent)}
+  a.back{color:var(--accent);text-decoration:none;font-family:var(--cond);font-weight:700;
+         letter-spacing:.12em;text-transform:uppercase;font-size:12px}
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .form{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:10px 16px;padding:14px;align-items:start}
+  @media (max-width:640px){.form{grid-template-columns:1fr}}
+  .form>label{margin:7px 0 0}
+  .form select,.form input{width:100%;font-family:var(--mono);font-size:12px}
+  .hint{font-size:11px;color:var(--mut);margin-top:4px;line-height:1.4}
+  .hint b{color:var(--ink);font-weight:600}
+  .warn{color:var(--err)}
+  h3{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.15em;text-transform:uppercase;
+     color:var(--mut);margin:0;padding:12px 14px 0;grid-column:1/-1}
+  .grow{flex:1}
+  .svc{font-family:var(--mono);font-size:10.5px;color:var(--mut)}
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/">← Console</a>
+  <h1>Config</h1>
+  <span class="grow"></span>
+  <span class="theme" id="theme" role="group" aria-label="Theme">
+    <button data-t="auto">Auto</button><button data-t="light">Clair</button><button data-t="dark">Sombre</button>
+  </span>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Analyse — depuis Neon</h2>
+    <div class="bar">
+      <span class="hint" id="catInfo">—</span>
+      <span class="grow"></span>
+      <button id="refresh">Recharger depuis Neon</button>
+      <button class="p" id="saveAna">Appliquer</button>
+    </div>
+    <div class="msg" id="msgAna"></div>
+    <div class="form" id="ana"><div class="empty">chargement…</div></div>
+  </section>
+
+  <section class="panel">
+    <h2>Connexions (.env)</h2>
+    <div class="bar">
+      <span class="hint" id="envInfo">—</span>
+      <span class="grow"></span>
+      <button class="p" id="saveEnv">Enregistrer</button>
+    </div>
+    <div class="msg" id="msgEnv"></div>
+    <div class="form" id="env"><div class="empty">chargement…</div></div>
+  </section>
+</main>
+
+<script>
+const $ = i => document.getElementById(i);
+const esc = s => String(s ?? '').replace(/[<&"]/g, c => ({'<': '&lt;', '&': '&amp;', '"': '&quot;'}[c]));
+const S = {cat: {}, cur: {}, env: []};
+
+// ── theme (identique a la console) ──────────────────────────────────────────
+function applyTheme(t){
+  if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', t);
+  [...$('theme').children].forEach(b => b.setAttribute('aria-pressed', b.dataset.t === t));
+}
+$('theme').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try { localStorage.setItem('theme', b.dataset.t); } catch (_) {}
+  applyTheme(b.dataset.t);
+});
+try { applyTheme(localStorage.getItem('theme') || 'auto'); } catch (_) { applyTheme('auto'); }
+
+function msg(id, t, kind){ const m = $(id); m.textContent = t; m.className = 'msg' + (kind ? ' ' + kind : ''); }
+async function call(url, opts){
+  const r = await fetch(url, opts);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.detail || r.statusText);
+  return d;
+}
+const post = (url, body) => call(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
+
+// ── analyse ─────────────────────────────────────────────────────────────────
+function select(id, options, value, defLabel){
+  const opts = [`<option value="">${esc(defLabel)}</option>`]
+    .concat(options.map(o => `<option value="${esc(o.value)}"${String(o.value) === String(value ?? '') ? ' selected' : ''}>${esc(o.label)}</option>`));
+  // Un choix enregistre qui n'est plus dans le catalogue reste visible (sinon on le perdrait sans le voir).
+  if (value && !options.some(o => String(o.value) === String(value)))
+    opts.push(`<option value="${esc(value)}" selected>${esc(value)} (absent du catalogue)</option>`);
+  return `<select id="${id}">${opts.join('')}</select>`;
+}
+
+function renderAna(){
+  const c = S.cat, cur = S.cur;
+  if (!c.fetched_at){
+    $('catInfo').textContent = 'Aucun catalogue Neon en cache.';
+    $('ana').innerHTML = `<div class="empty">Clique « Recharger depuis Neon » (≈ 20 s sur la carte).</div>`;
+    return;
+  }
+  $('catInfo').textContent = `${c.boat} · ${c.boat_class} · lu le ${c.fetched_at.replace('T', ' à ').replace('Z', ' UTC')}`;
+  const tg = (c.targets || []).map(t => ({value: t.name, label: t.name + (t.complete ? '' : `  [${t.sides.join('/')} seulement]`)}));
+  const def = c.profile_defaults || {};
+  const refDef = def.ref_target_name;
+  const refMissing = refDef && !tg.some(t => t.value === refDef);
+  const chDef = (c.channel_configs || []).find(x => x.is_default);
+  const byType = {};
+  (c.analysis_configs || []).forEach(a => (byType[a.analysis_type] ||= []).push(a));
+  const ids = cur.analysis_config_ids || {};
+
+  let h = `<h3>Targets</h3>
+    <label for="target">Target de performance</label>
+    <div>${select('target', tg, cur.target_name, `— défaut du profil (${def.target_name || 'aucune'}) —`)}
+      <div class="hint">Colonnes <b>*_tgt_post</b>. Rangée par nom de base : <b>&lt;nom&gt;_upwind</b> + <b>&lt;nom&gt;_downwind</b>.</div></div>
+    <label for="ref">Target de référence</label>
+    <div>${select('ref', tg, cur.ref_target_name, `— défaut du profil (${refDef || 'aucune'}) —`)}
+      <div class="hint">Colonnes <b>*_tgt_post_ref</b> (r_VMG…). Vide = la target de performance si choisie, sinon le défaut du profil.
+      ${refMissing ? `<br><span class="warn">Le défaut ${esc(refDef)} n'existe pas dans cette base : sans choix ici, les métriques de référence sortent vides.</span>` : ''}</div></div>
+    ${tg.length ? '' : `<div></div><div class="hint warn">Aucune target ${esc(c.boat_class)} dans cette base Neon.</div>`}
+    <h3>Channel config</h3>
+    <label for="chcfg">Mapping des channels</label>
+    <div>${select('chcfg', (c.channel_configs || []).map(x => ({value: x.name, label: x.name + (x.description ? ' — ' + x.description : '')})), cur.channel_config_name,
+          `— défaut de la classe (${chDef ? chDef.name : 'is_default'}) —`)}
+      <div class="hint">Utilisé par la détection et l'analyse.</div></div>
+    <h3>Analysis configs</h3>`;
+  const types = Object.keys(byType).sort();
+  if (!types.length) h += `<div></div><div class="hint">Aucune analysis config ${esc(c.boat_class)} dans cette base.</div>`;
+  for (const t of types){
+    const opts = byType[t].map(a => ({value: a.id, label: `#${a.id} · ${a.name}${a.created ? ' · ' + a.created.slice(0, 10) : ''}${a.is_default ? ' · défaut' : ''}`}));
+    h += `<label for="ac_${esc(t)}">${esc(t)}</label>
+      <div>${select('ac_' + t, opts, ids[t], '— profil (code du toolkit) —')}
+        <div class="hint">${esc(byType[t][0].analyzer_class || '')}</div></div>`;
+  }
+  $('ana').innerHTML = h;
+  S.types = types;
+}
+
+async function loadAna(){
+  const d = await call('/api/analysis');
+  S.cat = d.catalog || {}; S.cur = d.current || {};
+  renderAna();
+}
+
+$('refresh').onclick = async () => {
+  const b = $('refresh'); b.disabled = true; b.textContent = 'lecture de Neon…';
+  try {
+    const d = await post('/api/analysis/refresh');
+    await loadAna();
+    msg('msgAna', `Catalogue Neon relu : ${d.targets} targets, ${d.analysis_configs} analysis configs.`, 'ok');
+  } catch (e) { msg('msgAna', 'Lecture de Neon impossible — ' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = 'Recharger depuis Neon'; }
+};
+
+$('saveAna').onclick = async () => {
+  if (!S.cat.fetched_at){ msg('msgAna', 'Recharge d\'abord le catalogue Neon.', 'err'); return; }
+  const b = $('saveAna'); b.disabled = true; b.textContent = '…';
+  const ids = {};
+  (S.types || []).forEach(t => { const v = $('ac_' + t).value; if (v) ids[t] = Number(v); });
+  try {
+    const d = await post('/api/analysis', {
+      target_name: $('target').value || null, ref_target_name: $('ref').value || null,
+      channel_config_name: $('chcfg').value || null, analysis_config_ids: ids,
+    });
+    await loadAna();
+    msg('msgAna', `Appliqué (version ${d.version})` + (d.detection_restarted ? ' — détection redémarrée.' : ' — la détection est arrêtée, pris en compte à son prochain démarrage.'), 'ok');
+  } catch (e) { msg('msgAna', 'Application impossible — ' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = 'Appliquer'; }
+};
+
+// ── connexions ──────────────────────────────────────────────────────────────
+function renderEnv(d){
+  $('envInfo').textContent = d.path;
+  let h = '', g = null;
+  for (const f of d.fields){
+    if (f.group !== g){ g = f.group; h += `<h3>${esc(g)}</h3>`; }
+    h += `<label for="env_${f.key}">${esc(f.label)}</label>
+      <div><input id="env_${f.key}" data-k="${f.key}" value="${esc(f.value)}" spellcheck="false" autocomplete="off">
+        <div class="hint"><span class="svc">${esc(f.key)}${f.services.length ? ' → recrée ' + f.services.join(', ') : ''}</span>${f.note ? ' — ' + esc(f.note) : ''}</div></div>`;
+  }
+  $('env').innerHTML = h;
+  S.env = d.fields;
+}
+async function loadEnv(){ renderEnv(await call('/api/env')); }
+
+$('saveEnv').onclick = async () => {
+  const values = {};
+  S.env.forEach(f => { const v = $('env_' + f.key).value; if (v !== f.value) values[f.key] = v; });
+  if (!Object.keys(values).length){ msg('msgEnv', 'Rien n\'a changé.'); return; }
+  const b = $('saveEnv'); b.disabled = true; b.textContent = '…';
+  try {
+    const d = await post('/api/env', {values});
+    await loadEnv();
+    let t = `Enregistré : ${d.changed.join(', ')} (sauvegarde ${d.backup}).`;
+    t += d.recreated.length ? ` Recréés : ${d.recreated.join(', ')}.` : ' Aucun service concerné en marche : pris en compte au prochain démarrage.';
+    if (d.control_restart_needed) t += ' La console affichera le nouveau bateau après son redémarrage.';
+    msg('msgEnv', t, 'ok');
+  } catch (e) { msg('msgEnv', 'Enregistrement impossible — ' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = 'Enregistrer'; }
+};
+
+loadAna().catch(e => msg('msgAna', 'Chargement impossible — ' + e.message, 'err'));
+loadEnv().catch(e => msg('msgEnv', 'Chargement impossible — ' + e.message, 'err'));
+</script>
+</body>
+</html>
