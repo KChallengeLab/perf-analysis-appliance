@@ -1,4 +1,6 @@
-# perf-analysis-appliance
+# YODA — Yacht Onboard Data Analysis
+
+Repo `perf-analysis-appliance`.
 
 A headless, self-contained **Docker appliance** that runs the sailing performance pipeline **on the
 boat**: it ingests the boat's live telemetry, detects points of interest (tacks, gybes, straight

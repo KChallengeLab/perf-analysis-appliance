@@ -1,4 +1,4 @@
-"""Onboard Data Analysis Console — l'unique interface de gestion de la carte (defaut :4267).
+"""YODA (Yacht Onboard Data Analysis) console — l'unique interface de gestion de la carte (defaut :4267).
 
 Une seule page pour operer le transmetteur depuis un navigateur, sur un poste du bord :
   - allumer / eteindre / redemarrer la chaine, service par service ou d'un bloc ;
@@ -49,7 +49,7 @@ HISTORY = int(os.getenv("HISTORY", "300"))
 LOG_LINES = int(os.getenv("LOG_LINES", "600"))
 
 APP_DIR = Path(__file__).parent
-app = FastAPI(title="Onboard Data Analysis Console")
+app = FastAPI(title="YODA — Yacht Onboard Data Analysis")
 _FONTS = APP_DIR / "fonts"
 if _FONTS.is_dir():
     app.mount("/fonts", StaticFiles(directory=str(_FONTS)), name="fonts")

@@ -1,4 +1,4 @@
-# Deployment runbook — perf-analysis appliance on the CIS (boat machine)
+# Deployment runbook — YODA (Yacht Onboard Data Analysis) on the CIS (boat machine)
 
 How to bring the appliance up on the onboard **CIS** Windows machine. This is **Phase 3** of
 [`../onboard-appliance.md`](../onboard-appliance.md), grounded in what was validated on the dev box
